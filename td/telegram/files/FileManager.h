@@ -552,8 +552,12 @@ class FileManager final : public Actor {
 
   void read_file_part(FileId file_id, int64 offset, int64 count, int left_tries, Promise<string> promise);
 
+<<<<<<< HEAD
   // STREAMING VERSION - TDLib 1.8.55-streaming
   // Stream file part without requiring full download - saves 99%+ disk space
+=======
+  // Stream file part without requiring full download - for true streaming
+>>>>>>> 9fae1ae6dd2c242610553e0e7bf84e828ffbad13
   void stream_file_part(FileId file_id, int64 offset, int64 count, Promise<string> promise);
 
   void delete_file(FileId file_id, Promise<Unit> promise, const char *source);
@@ -807,6 +811,7 @@ class FileManager final : public Actor {
   FlatHashMap<FileId, UserFileDownloadInfo, FileIdHash> pending_user_file_downloads_;
 
   class UserDownloadFileCallback;
+  class StreamingDownloadFileCallback;
 
   std::shared_ptr<UserDownloadFileCallback> user_download_file_callback_;
 
