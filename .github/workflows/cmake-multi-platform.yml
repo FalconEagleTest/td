@@ -1,0 +1,225 @@
+name: tdlib-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_android:
+        description: "Build for Android?"
+        required: false
+        default: "true"
+        type: boolean
+      build_macos:
+        description: "Build for macOS Intel?"
+        required: false
+        default: "false"
+        type: boolean
+      build_ios:
+        description: "Build for iOS?"
+        required: false
+        default: "false"
+        type: boolean
+      build_linux:
+        description: "Build for Linux x64?"
+        required: false
+        default: "false"
+        type: boolean
+      build_windows:
+        description: "Build for Windows x64?"
+        required: false
+        default: "true"
+        type: boolean
+
+jobs:
+  build-android:
+    if: github.event.inputs.build_android == 'true'
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-java@v2
+        with:
+          java-version: 17
+          distribution: adopt
+  
+      - name: Setup dependencies
+        run: |
+          sudo apt-get install -y make git zlib1g-dev libssl-dev gperf cmake clang libc++-dev libc++abi-dev ninja-build
+  
+      - name: Clone TDLib
+        run: |
+          git clone https://github.com/FalconEagleTest/td.git
+          cd td
+          git checkout master
+          git show --summary
+  
+      - name: Fetch Android SDK
+        run: |
+          cd td/example/android
+          ./fetch-sdk.sh
+  
+      - name: Build OpenSSL for Android
+        run: |
+          cd td/example/android
+          ./build-openssl.sh
+  
+      - name: Build TDLib for Android
+        run: |
+          cd td/example/android
+          ./build-tdlib.sh '' '' '' '' 'JSON'
+  
+      - name: Upload Android Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-android
+          path: td/example/android/tdlib/tdlib.zip
+
+
+
+  build-macos-intel:
+    if: github.event.inputs.build_macos == 'true'
+    runs-on: macos-11
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup dependencies
+        run: |
+          brew install gperf cmake coreutils
+
+      - name: Clone TDLib
+        run: |
+          git clone https://github.com/tdlib/td.git
+          cd td
+          git checkout master
+          git show --summary
+
+      - name: Build TDLib for macOS
+        run: |
+          cd td/example/ios
+          ./build.sh
+
+      - name: Upload macOS Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-macos
+          path: td/example/ios/tdjson/macOS/lib/libtdjson.zip
+
+  build-ios:
+    if: github.event.inputs.build_ios == 'true'
+    runs-on: macos-11
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup dependencies
+        run: |
+          brew install gperf cmake coreutils
+
+      - name: Clone TDLib
+        run: |
+          git clone https://github.com/tdlib/td.git
+          cd td
+          git checkout master
+          git show --summary
+
+      - name: Build TDLib for iOS
+        run: |
+          cd td/example/ios
+          ./build.sh
+
+      - name: Upload iOS Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-ios
+          path: td/example/ios/tdjson/iOS/lib/libtdjson.zip
+
+  build-linux-x64:
+    if: github.event.inputs.build_linux == 'true'
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup dependencies
+        run: |
+          sudo apt-get install make git zlib1g-dev libssl-dev gperf php-cli cmake g++
+
+      - name: Clone TDLib
+        run: |
+          git clone https://github.com/tdlib/td.git
+          cd td
+          git checkout master
+          git show --summary
+
+      - name: Build TDLib for Linux
+        run: |
+          cd td
+          mkdir build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=../tdlib ..
+          cmake --build . --target install
+
+      - name: Upload Linux Build
+        uses: actions/upload-artifact@v3
+        with:
+          name: tdlib-linux
+          path: td/tdlib/lib/libtdjson.zip
+
+  build-windows-x64:
+    if: github.event.inputs.build_windows == 'true'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v2
+      - name: Clone TDLib
+        run: |
+          git clone https://github.com/tdlib/td.git
+          cd td
+          git checkout master
+          git show --summary
+
+      - name: Setup vcpkg
+        run: |
+          cd td
+          git clone https://github.com/Microsoft/vcpkg.git
+          cd vcpkg
+          ./bootstrap-vcpkg.bat
+          ./vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows
+
+      - name: Build TDLib for Windows
+        run: |
+          cd td
+          mkdir build
+          cd build
+          cmake -A x64 -DCMAKE_INSTALL_PREFIX:PATH=../tdlib -DCMAKE_TOOLCHAIN_FILE:FILEPATH=../vcpkg/scripts/buildsystems/vcpkg.cmake ..
+          cmake --build . --target install --config Release
+      - name: zip
+        run: |
+          cd td/tdlib/bin
+          ls
+          mv libcrypto-3-x64.dll libcrypto-1_1.dll
+          mv libssl-3-x64.dll libssl-1_1.dll
+          7z a -tzip dlls.zip libcrypto-1_1.dll libssl-1_1.dll tdjson.dll zlib1.dll
+      - name: Upload Windows Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-windows
+          path: td/tdlib/bin/dlls.zip
+
+  release:
+    needs: [build-android, build-macos-intel, build-ios, build-linux-x64, build-windows-x64]
+    if: always()
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Get current date/time
+        id: datetime
+        run: echo "DATE=$(date -u +'%Y-%m-%d_%H-%M')" >> $GITHUB_ENV
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List downloaded artifacts
+        run: ls -R artifacts
+
+      - name: Create a GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: tdlib-${{ env.DATE }}
+          name: TDLib Build ${{ env.DATE }}
+          body: "TDLib build release containing all selected platform binaries."
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: "artifacts/**/**"
