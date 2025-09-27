@@ -1267,6 +1267,30 @@ void prepare_path_for_pmc(FileType file_type, string &path) {
 }
 }  // namespace
 
+class FileManager::StreamingDownloadFileCallback final : public FileManager::DownloadCallback {
+  Promise<string> promise_;
+  int64 offset_;
+  int64 count_;
+
+ public:
+  explicit StreamingDownloadFileCallback(Promise<string> promise, int64 offset, int64 count) 
+    : promise_(std::move(promise)), offset_(offset), count_(count) {
+  }
+
+  void on_download_ok(FileId file_id) final {
+    // The partial download is complete, now read the specific part
+    send_closure(G()->file_manager(), &FileManager::read_file_part, file_id, offset_, count_, 2, std::move(promise_));
+  }
+
+  void on_download_error(FileId file_id, Status error) final {
+    promise_.set_error(400, PSLICE() << "Failed to download file part: " << error.message());
+  }
+  
+  void on_download_error(Status error) {
+    promise_.set_error(400, PSLICE() << "Failed to download file part: " << error.message());
+  }
+};
+
 class FileManager::UserDownloadFileCallback final : public FileManager::DownloadCallback {
   FileManager *file_manager_;
 
@@ -2907,6 +2931,47 @@ void FileManager::read_file_part(FileId file_id, int64 offset, int64 count, int 
       });
   send_closure(file_load_manager_, &FileLoadManager::read_file_part, *path, offset, count,
                std::move(read_file_part_promise));
+}
+
+void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Promise<string> promise) {
+  TRY_STATUS_PROMISE(promise, G()->close_status());
+
+  if (!file_id.is_valid()) {
+    return promise.set_error(400, "File identifier is invalid");
+  }
+  auto node = get_sync_file_node(file_id);
+  if (!node) {
+    return promise.set_error(400, "File not found");
+  }
+  if (offset < 0) {
+    return promise.set_error(400, "Parameter offset must be non-negative");
+  }
+  if (count <= 0) {
+    return promise.set_error(400, "Parameter count must be positive");
+  }
+  if (count >= static_cast<int64>(std::numeric_limits<size_t>::max() / 2 - 1)) {
+    return promise.set_error(400, "Part length is too big");
+  }
+
+  auto file_view = FileView(node);
+  
+  // Check if we already have this part downloaded
+  if (file_view.downloaded_prefix(offset) >= count) {
+    // We can read from existing file - use the original method
+    return read_file_part(file_id, offset, count, 2, std::move(promise));
+  }
+  
+  // Create a callback to handle the streaming download completion
+  auto streaming_callback = std::make_shared<StreamingDownloadFileCallback>(std::move(promise), offset, count);
+  
+  // Download only the requested part (offset to offset + count) with high priority for streaming
+  download(file_id, 0, streaming_callback, 32, offset, count, 
+           PromiseCreator::lambda([streaming_callback](Result<td_api::object_ptr<td_api::file>> result) {
+             // The actual data reading is handled by the callback
+             if (result.is_error()) {
+               streaming_callback->on_download_error(result.error());
+             }
+           }));
 }
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {

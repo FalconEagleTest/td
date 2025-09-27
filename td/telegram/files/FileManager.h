@@ -552,6 +552,9 @@ class FileManager final : public Actor {
 
   void read_file_part(FileId file_id, int64 offset, int64 count, int left_tries, Promise<string> promise);
 
+  // Stream file part without requiring full download - for true streaming
+  void stream_file_part(FileId file_id, int64 offset, int64 count, Promise<string> promise);
+
   void delete_file(FileId file_id, Promise<Unit> promise, const char *source);
 
   void external_file_generate_write_part(int64 generation_id, int64 offset, string data, Promise<> promise);
@@ -803,6 +806,7 @@ class FileManager final : public Actor {
   FlatHashMap<FileId, UserFileDownloadInfo, FileIdHash> pending_user_file_downloads_;
 
   class UserDownloadFileCallback;
+  class StreamingDownloadFileCallback;
 
   std::shared_ptr<UserDownloadFileCallback> user_download_file_callback_;
 
