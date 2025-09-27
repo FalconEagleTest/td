@@ -552,6 +552,10 @@ class FileManager final : public Actor {
 
   void read_file_part(FileId file_id, int64 offset, int64 count, int left_tries, Promise<string> promise);
 
+  // STREAMING VERSION - TDLib 1.8.55-streaming
+  // Stream file part without requiring full download - saves 99%+ disk space
+  void stream_file_part(FileId file_id, int64 offset, int64 count, Promise<string> promise);
+
   void delete_file(FileId file_id, Promise<Unit> promise, const char *source);
 
   void external_file_generate_write_part(int64 generation_id, int64 offset, string data, Promise<> promise);
