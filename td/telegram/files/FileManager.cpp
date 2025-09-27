@@ -2934,13 +2934,10 @@ void FileManager::read_file_part(FileId file_id, int64 offset, int64 count, int 
 }
 
 void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Promise<string> promise) {
-<<<<<<< HEAD
   // STREAMING VERSION - TDLib 1.8.55-streaming
   // This method downloads only the requested part without downloading entire file
   // Saves 99%+ disk space for large video files
   
-=======
->>>>>>> 9fae1ae6dd2c242610553e0e7bf84e828ffbad13
   TRY_STATUS_PROMISE(promise, G()->close_status());
 
   if (!file_id.is_valid()) {
@@ -2968,7 +2965,6 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
     return read_file_part(file_id, offset, count, 2, std::move(promise));
   }
   
-<<<<<<< HEAD
   // For true streaming, we download only the requested part using downloadFile with offset/limit
   // This is the key difference from read_file_part which requires full file download first
   auto streaming_promise = PromiseCreator::lambda(
@@ -2986,19 +2982,7 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
   // Download only the requested part (offset to offset + count) with high priority
   // This uses the existing downloadFile infrastructure but with specific offset/limit
   download_file(file_id, 32, offset, count, false, std::move(streaming_promise));
-=======
-  // Create a callback to handle the streaming download completion
-  auto streaming_callback = std::make_shared<StreamingDownloadFileCallback>(std::move(promise), offset, count);
-  
-  // Download only the requested part (offset to offset + count) with high priority for streaming
-  download(file_id, 0, streaming_callback, 32, offset, count, 
-           PromiseCreator::lambda([streaming_callback](Result<td_api::object_ptr<td_api::file>> result) {
-             // The actual data reading is handled by the callback
-             if (result.is_error()) {
-               streaming_callback->on_download_error(result.error());
-             }
-           }));
->>>>>>> 9fae1ae6dd2c242610553e0e7bf84e828ffbad13
+}
 }
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {
