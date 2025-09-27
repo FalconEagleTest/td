@@ -85,7 +85,7 @@ jobs:
 
       - name: Clone TDLib
         run: |
-          git clone https://github.com/tdlib/td.git
+          git clone https://github.com/FalconEagleTest/td.git
           cd td
           git checkout master
           git show --summary
@@ -112,7 +112,7 @@ jobs:
 
       - name: Clone TDLib
         run: |
-          git clone https://github.com/tdlib/td.git
+          git clone https://github.com/FalconEagleTest/td.git
           cd td
           git checkout master
           git show --summary
@@ -139,7 +139,7 @@ jobs:
 
       - name: Clone TDLib
         run: |
-          git clone https://github.com/tdlib/td.git
+          git clone https://github.com/FalconEagleTest/td.git
           cd td
           git checkout master
           git show --summary
@@ -165,7 +165,7 @@ jobs:
       - uses: actions/checkout@v2
       - name: Clone TDLib
         run: |
-          git clone https://github.com/tdlib/td.git
+          git clone https://github.com/FalconEagleTest/td.git
           cd td
           git checkout master
           git show --summary
