@@ -205,14 +205,18 @@ jobs:
           ./bootstrap-vcpkg.bat
           ./vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows
 
-      - name: Cache CMake build
+      # CMake build cache - saves object files for incremental builds
+      # Key strategy: Only invalidate when CMake config changes, not source files
+      # CMake is smart enough to rebuild only changed source files
+      - name: Cache CMake build  
         uses: actions/cache@v4
         id: cache-cmake
         with:
           path: |
             build
-          key: ${{ runner.os }}-cmake-${{ hashFiles('**/CMakeLists.txt', '**/GitCommitHash.cpp.in', 'td/**/*.cpp', 'td/**/*.h') }}
+          key: ${{ runner.os }}-cmake-config-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'td/**/CMakeLists.txt') }}
           restore-keys: |
+            ${{ runner.os }}-cmake-config-
             ${{ runner.os }}-cmake-
 
       - name: Add build info
@@ -226,12 +230,21 @@ jobs:
         run: |
           if (!(Test-Path "build")) { New-Item -Path "build" -ItemType Directory }
           cd build
-          Write-Host "🔧 Configuring CMake..."
-          cmake -A x64 -DCMAKE_INSTALL_PREFIX:PATH=../tdlib -DCMAKE_TOOLCHAIN_FILE:FILEPATH=../vcpkg/scripts/buildsystems/vcpkg.cmake -DTD_VERSION_EXTRA="streaming-readFilePart" ..
-          Write-Host "🏗️ Building TDLib..."
+          
+          # Configure CMake (only if not cached or configuration changed)
+          if (!(Test-Path "CMakeCache.txt") -or "${{ steps.cache-cmake.outputs.cache-hit }}" -ne "true") {
+            Write-Host "🔧 Configuring CMake..."
+            cmake -A x64 -DCMAKE_INSTALL_PREFIX:PATH=../tdlib -DCMAKE_TOOLCHAIN_FILE:FILEPATH=../vcpkg/scripts/buildsystems/vcpkg.cmake -DTD_VERSION_EXTRA="streaming-readFilePart" ..
+          } else {
+            Write-Host "⚡ Using cached CMake configuration"
+          }
+          
+          Write-Host "🏗️ Building TDLib (incremental)..."
           cmake --build . --config Release
+          
           Write-Host "📦 Installing TDLib..."
           cmake --build . --config Release --target install
+          
           Write-Host "📁 Checking build output..."
           Get-ChildItem -Recurse ../tdlib
           
