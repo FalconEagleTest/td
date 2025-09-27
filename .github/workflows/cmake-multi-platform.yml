@@ -192,8 +192,9 @@ jobs:
           path: |
             vcpkg
             vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
+          key: ${{ runner.os }}-vcpkg-stable-v1
           restore-keys: |
+            ${{ runner.os }}-vcpkg-stable-
             ${{ runner.os }}-vcpkg-
 
       - name: Setup vcpkg
