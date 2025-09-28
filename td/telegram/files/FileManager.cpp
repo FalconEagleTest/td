@@ -26,17 +26,21 @@ class UploadGetFileCallback : public td::NetQueryCallback {
   td::Promise<td::string> promise_;
   explicit UploadGetFileCallback(td::Promise<td::string> promise) : promise_(std::move(promise)) {}
   void on_result(td::NetQueryPtr net_query) override {
-    if (net_query->is_error()) {
+  if (net_query->is_error()) { 
       promise_.set_error(net_query->move_as_error());
       return;
     }
-    TRY_RESULT(result, fetch_result<td::telegram_api::upload_getFile>(net_query->move_as_ok()));
-    auto file_result = result.move_as_ok();
-    if (file_result->get_id() != td::telegram_api::upload_file::ID) {
+    auto tl_object = net_query->move_as_ok();
+    auto ptr = td::telegram_api::upload_getFile::fetch(std::move(tl_object));
+    if (!ptr) {
+      promise_.set_error(td::Status::Error(500, "Failed to fetch upload.getFile result"));
+      return;
+    }
+    if (ptr->get_id() != td::telegram_api::upload_file::ID) {
       promise_.set_error(td::Status::Error(500, "Invalid response type from upload.getFile"));
       return;
     }
-    auto upload_file = static_cast<td::telegram_api::upload_file*>(file_result.get());
+    auto upload_file = static_cast<td::telegram_api::upload_file*>(ptr.get());
     promise_.set_value(upload_file->bytes_.as_slice().str());
   }
 };
@@ -2997,8 +3001,8 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
   auto dc_id = remote_location->get_dc_id();
   auto net_query = G()->net_query_creator().create(query, {}, dc_id);
   G()->net_query_dispatcher().dispatch_with_callback(
-    std::move(net_query),
-    create_actor_shared<UploadGetFileCallback>("UploadGetFileCallback", std::move(promise))
+  std::move(net_query), 
+    td::actor::create_actor_shared<UploadGetFileCallback>("UploadGetFileCallback", std::move(promise))
   );
 }
 
