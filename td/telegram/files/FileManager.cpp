@@ -2964,38 +2964,42 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
     return read_file_part(file_id, offset, count, 2, std::move(promise));
   }
   
-  // TRUE STREAMING: Use Telegram API to get file part directly
-  // For now, return the requested data as zeros to test the streaming path
-  // In production, this would make a direct MTProto call to upload.getFile
-  if (!file_view.remote_location().is_full()) {
+  // STREAMING IMPLEMENTATION: Get actual file data from Telegram
+  // This downloads the specific file part directly from Telegram servers
+  if (!file_view.has_full_remote_location()) {
     return promise.set_error(Status::Error(400, "File has no remote location"));
   }
 
-  // TEMPORARY STREAMING IMPLEMENTATION: Return actual data that Kodi can use
-  // This proves the streaming path works and eliminates the "not enough downloaded bytes" error
-  LOG(INFO) << "STREAMING: Simulating download file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
+  // REAL STREAMING: Download the specific part from Telegram
+  LOG(INFO) << "STREAMING: Downloading real data file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
   
-  // Generate test data that looks like a real video file header
-  // This will at least allow Kodi to start playback and test the streaming path
-  string result;
-  result.reserve(count);
-  
-  // Add some realistic video file header bytes (MP4/MKV-like)
-  if (offset == 0 && count > 8) {
-    // MP4 ftyp box header
-    result.append("\x00\x00\x00\x20\x66\x74\x79\x70", 8);
-    result.append("mp41", 4);
-    result.append("\x00\x00\x00\x00", 4);
-    result.append("mp41isom", 8);
-    // Fill the rest with zeros
-    result.append(count - 24, '\0');
-  } else {
-    // For other offsets, return zeros (simulating file content)
-    result.append(count, '\0');
-  }
-  
-  LOG(INFO) << "STREAMING: Returning " << result.size() << " bytes for offset=" << offset;
-  promise.set_value(std::move(result));
+  // Create a custom download callback that reads the file part once downloaded
+  class StreamingDownloadCallback : public DownloadCallback {
+   private:
+    FileManager *file_manager_;
+    FileId file_id_;
+    int64 offset_;
+    int64 count_;
+    Promise<string> promise_;
+    
+   public:
+    StreamingDownloadCallback(FileManager *fm, FileId fid, int64 off, int64 cnt, Promise<string> promise)
+      : file_manager_(fm), file_id_(fid), offset_(off), count_(cnt), promise_(std::move(promise)) {}
+    
+    void on_download_ok(FileId file_id) override {
+      LOG(INFO) << "STREAMING: Download completed, reading file part";
+      file_manager_->read_file_part(file_id_, offset_, count_, 2, std::move(promise_));
+    }
+    
+    void on_download_error(FileId file_id, Status error) override {
+      LOG(ERROR) << "STREAMING: Download failed: " << error;
+      promise_.set_error(std::move(error));
+    }
+  };
+
+  // Start the actual download from Telegram servers for this specific part
+  auto callback = std::make_shared<StreamingDownloadCallback>(this, file_id, offset, count, std::move(promise));
+  download(file_id, 0, callback, 1, offset, count);
 }
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {
