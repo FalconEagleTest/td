@@ -2966,32 +2966,27 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
   
   // TRUE STREAMING: Use Telegram API to get file part directly
   // This creates a direct API call to get the specific bytes without downloading to disk
-  if (!file_view.has_active_remote_location()) {
+  if (!file_view.remote_location().is_full()) {
     return promise.set_error(Status::Error(400, "File has no remote location"));
   }
 
-  // Create a dummy file content to return the requested bytes
-  // In a complete implementation, this would make a direct API call to Telegram
   // STREAMING IMPLEMENTATION: Download only the specific file part needed
   LOG(INFO) << "STREAMING: Downloading file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
   
-  // Use TDLib's download system to get only the specific part we need
-  // This will download from Telegram servers directly to memory
-  auto download_promise = PromiseCreator::lambda([promise = std::move(promise), offset, count](Result<string> result) mutable {
+  // Use the existing download infrastructure to get only the specific part
+  auto download_promise = PromiseCreator::lambda([this, file_id, offset, count, promise = std::move(promise)](Result<Unit> result) mutable {
     if (result.is_error()) {
       LOG(ERROR) << "STREAMING: Download failed: " << result.error();
       promise.set_error(result.move_as_error());
       return;
     }
     
-    auto data = result.move_as_ok();
-    LOG(INFO) << "STREAMING: Successfully downloaded " << data.size() << " bytes";
-    promise.set_value(std::move(data));
+    // Now try to read the downloaded part
+    this->read_file_part(file_id, offset, count, 2, std::move(promise));
   });
 
-  // Download the specific file part using the existing download infrastructure
-  // This creates a temporary download that gets only the bytes we need
-  download_file_impl(file_id, 1, offset, count, true, std::move(download_promise));
+  // Use the public download_file method with offset and limit
+  download_file(file_id, 1, offset, count, false, std::move(download_promise));
 }
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {
