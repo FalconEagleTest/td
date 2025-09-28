@@ -2972,24 +2972,32 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
   auto query = telegram_api::upload_getFile(0, false, false, std::move(input_location), offset, narrow_cast<int32>(count));
   auto dc_id = remote_location->get_dc_id();
   auto net_query = G()->net_query_creator().create(query, {}, dc_id);
-  G()->net_query_dispatcher().dispatch_with_callback(
-    std::move(net_query),
-    PromiseCreator::lambda([promise = std::move(promise)](Result<tl_object_ptr<telegram_api::upload_File>> result) mutable {
+  class UploadGetFileCallback : public NetQueryCallback {
+   public:
+    Promise<string> promise_;
+    explicit UploadGetFileCallback(Promise<string> promise) : promise_(std::move(promise)) {}
+    void on_result(NetQueryPtr net_query) override {
+      if (net_query->is_error()) {
+        promise_.set_error(net_query->move_as_error());
+        return;
+      }
+      auto result = fetch_result<telegram_api::upload_getFile>(net_query->move_as_ok());
       if (result.is_error()) {
-        LOG(ERROR) << "STREAMING: upload.getFile failed: " << result.error();
-        promise.set_error(result.move_as_error());
+        promise_.set_error(result.move_as_error());
         return;
       }
       auto file_result = result.move_as_ok();
       if (file_result->get_id() != telegram_api::upload_file::ID) {
-        promise.set_error(Status::Error(500, "Invalid response type from upload.getFile"));
+        promise_.set_error(Status::Error(500, "Invalid response type from upload.getFile"));
         return;
       }
       auto upload_file = static_cast<telegram_api::upload_file*>(file_result.get());
-  auto bytes_data = std::move(upload_file->bytes_);
-  LOG(INFO) << "STREAMING: Got " << bytes_data.size() << " bytes from Telegram upload.getFile";
-  promise.set_value(bytes_data.as_slice().str());
-    })
+      promise_.set_value(upload_file->bytes_.as_slice().str());
+    }
+  };
+  G()->net_query_dispatcher().dispatch_with_callback(
+    std::move(net_query),
+    td::make_actor_shared<UploadGetFileCallback>(std::move(promise))
   );
 }
 
