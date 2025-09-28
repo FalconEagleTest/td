@@ -328,7 +328,7 @@ jobs:
 
   release:
     needs: [build-android, build-macos-intel, build-ios, build-linux-x64, build-windows-x64]
-    if: always() && (needs.build-android.result != 'skipped' || needs.build-macos-intel.result != 'skipped' || needs.build-ios.result != 'skipped' || needs.build-linux-x64.result != 'skipped' || needs.build-windows-x64.result != 'skipped')
+    if: always() && (needs.build-android.result == 'success' || needs.build-macos-intel.result == 'success' || needs.build-ios.result == 'success' || needs.build-linux-x64.result == 'success' || needs.build-windows-x64.result == 'success')
     runs-on: ubuntu-20.04
     steps:
       - name: Get current date/time

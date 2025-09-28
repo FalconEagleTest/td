@@ -737,7 +737,30 @@ class TdClient {
   readFilePart(query) {
     let res;
     try {
-      //const file_size = this.FS.stat(query.path).size;
+      // STREAMING MODE: Use file_id instead of path for direct streaming
+      if (query.file_id) {
+        console.log('STREAMING readFilePart called:', query.file_id, query.offset, query.count);
+        
+        // Use the core TDLib API to call readFilePart - this is the key!
+        // Instead of trying to read from a file, we forward the request to TDLib directly
+        const readFilePartQuery = {
+          '@type': 'readFilePart',
+          'file_id': query.file_id,
+          'offset': query.offset,
+          'count': query.count,
+          '@extra': query['@extra']
+        };
+        
+        // Send the query directly to TDLib core using td_send
+        this.td_functions.td_send(this.client_id, JSON.stringify(readFilePartQuery));
+        this.scheduleReceiveSoon();
+        
+        // Don't callback here - let the normal TDLib response handling deal with it
+        // The response will come through the normal receive() -> prepareResponse() -> callback() flow
+        return;
+      }
+      
+      // TRADITIONAL MODE: Use path for local file access  
       const stream = this.FS.open(query.path, 'r');
       const buf = new Uint8Array(query.count);
       this.FS.read(stream, buf, 0, query.count, query.offset);
