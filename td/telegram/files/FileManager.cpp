@@ -1,5 +1,6 @@
 #include "td/telegram/telegram_api.h"
-using ::create_actor_shared;
+// ActorOwn is defined in td/actor/impl/ActorId-decl.h, so include it for clarity
+#include "td/actor/impl/ActorId-decl.h"
 //
 // Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
