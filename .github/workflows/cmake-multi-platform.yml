@@ -17,6 +17,11 @@ on:
       - '.github/workflows/**'
   workflow_dispatch:
     inputs:
+      force_rebuild_cache:
+        description: "Force rebuild vcpkg cache?"
+        required: false
+        default: "false"
+        type: boolean
       build_android:
         description: "Build for Android?"
         required: false
@@ -173,7 +178,7 @@ jobs:
           path: td/tdlib/lib/libtdjson.zip
 
   build-windows-x64:
-    if: github.event.inputs.build_windows == 'true'
+    if: github.event.inputs.build_windows == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -188,6 +193,7 @@ jobs:
       - name: Cache vcpkg
         uses: actions/cache@v4
         id: cache-vcpkg
+        if: github.event.inputs.force_rebuild_cache != 'true'
         with:
           path: |
             vcpkg
@@ -197,13 +203,23 @@ jobs:
             ${{ runner.os }}-vcpkg-stable-
             ${{ runner.os }}-vcpkg-
 
-      - name: Setup vcpkg
+      - name: Setup vcpkg (Optimized)
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: |
-          git clone https://github.com/Microsoft/vcpkg.git
-          cd vcpkg
-          ./bootstrap-vcpkg.bat
-          ./vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows
+          Write-Host "🚀 Setting up vcpkg with pre-built packages..."
+          
+          # Use vcpkg from Visual Studio installation (faster)
+          if (Test-Path "C:\vcpkg") {
+            Write-Host "✅ Using system vcpkg"
+            $env:VCPKG_ROOT = "C:\vcpkg"
+            C:\vcpkg\vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows --triplet x64-windows
+          } else {
+            Write-Host "📦 Cloning fresh vcpkg..."
+            git clone https://github.com/Microsoft/vcpkg.git --depth 1
+            cd vcpkg
+            ./bootstrap-vcpkg.bat
+            ./vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows --triplet x64-windows
+          }
 
       # CMake build cache - saves object files for incremental builds
       # Key strategy: Only invalidate when CMake config changes, not source files
@@ -312,7 +328,7 @@ jobs:
 
   release:
     needs: [build-android, build-macos-intel, build-ios, build-linux-x64, build-windows-x64]
-    if: always()
+    if: always() && (needs.build-android.result != 'skipped' || needs.build-macos-intel.result != 'skipped' || needs.build-ios.result != 'skipped' || needs.build-linux-x64.result != 'skipped' || needs.build-windows-x64.result != 'skipped')
     runs-on: ubuntu-20.04
     steps:
       - name: Get current date/time
