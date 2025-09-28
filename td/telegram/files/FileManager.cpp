@@ -21,24 +21,61 @@
 #include "td/telegram/net/NetQueryDispatcher.h"
 #include "td/telegram/net/NetQuery.h"
 #include "td/actor/actor.h"
-// Handler for upload.getFile streaming result
-class UploadGetFileCallback : public td::NetQueryCallback {
+
+// Minimal one-shot actor to fetch upload.getFile bytes using existing TDLib helpers
+class StreamGetFileActor final : public Actor, public NetQueryCallback {
  public:
-  td::Promise<td::string> promise_;
-  explicit UploadGetFileCallback(td::Promise<td::string> promise) : promise_(std::move(promise)) {}
-  void on_result(td::NetQueryPtr net_query) override {
+  StreamGetFileActor(FileId file_id, int64 offset, int32 length, FullRemoteFileLocation remote,
+                     Promise<string> promise)
+      : file_id_(file_id)
+      , offset_(offset)
+      , length_(length)
+      , remote_(std::move(remote))
+      , promise_(std::move(promise)) {
+  }
+
+  void start_up() override {
+    if (!remote_.is_valid()) {
+      promise_.set_error(Status::Error(400, "Invalid remote location"));
+      stop();
+      return;
+    }
+    auto input_location = remote_.as_input_file_location();
+    if (!input_location) {
+      promise_.set_error(Status::Error(400, "Can't create input location"));
+      stop();
+      return;
+    }
+    auto query = telegram_api::upload_getFile(0, false, false, std::move(input_location), offset_, length_);
+    auto net_query = G()->net_query_creator().create(query, {}, remote_.get_dc_id());
+    G()->net_query_dispatcher().dispatch_with_callback(std::move(net_query), actor_shared(this));
+  }
+
+  void on_result(NetQueryPtr net_query) override {
     if (net_query->is_error()) {
       promise_.set_error(net_query->move_as_error());
+      stop();
       return;
     }
-    auto tl_object = net_query->move_as_ok();
-    auto *file_result = dynamic_cast<td::telegram_api::upload_file *>(tl_object.get());
-    if (!file_result) {
-      promise_.set_error(td::Status::Error(500, "Invalid response type from upload.getFile"));
-      return;
-    }
-    promise_.set_value(file_result->bytes_.as_slice().str());
+    TRY_RESULT_PROMISE(promise_, file_base, fetch_result<telegram_api::upload_getFile>(net_query->ok()));
+    auto *upload_file = static_cast<telegram_api::upload_file *>(file_base.get());
+    promise_.set_value(upload_file->bytes_.as_slice().str());
+    stop();
   }
+
+  void hangup() override {
+    if (promise_) {
+      promise_.set_error(Status::Error(500, "Canceled"));
+    }
+    stop();
+  }
+
+ private:
+  FileId file_id_;
+  int64 offset_;
+  int32 length_;
+  FullRemoteFileLocation remote_;
+  Promise<string> promise_;
 };
 #include "td/telegram/logevent/LogEvent.h"
 #include "td/telegram/misc.h"
@@ -2993,13 +3030,9 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
 
   LOG(INFO) << "STREAMING: Direct upload.getFile call - file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
 
-  auto query = telegram_api::upload_getFile(0, false, false, std::move(input_location), offset, narrow_cast<int32>(count));
-  auto dc_id = remote_location->get_dc_id();
-  auto net_query = G()->net_query_creator().create(query, {}, dc_id);
-  G()->net_query_dispatcher().dispatch_with_callback(
-    std::move(net_query),
-    ActorOwn<UploadGetFileCallback>(new UploadGetFileCallback(std::move(promise)))
-  );
+  auto actor = create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, narrow_cast<int32>(count),
+                                                remote_location->as_input_full(), std::move(promise));
+  streaming_stream_actors_.push_back(std::move(actor));
 }
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {

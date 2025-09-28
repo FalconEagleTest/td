@@ -612,6 +612,8 @@ class FileManager final : public Actor {
 
   template <class ParserT>
   FileId parse_file(ParserT &parser);
+  // Keep temporary streaming actors alive until completion (one-shot upload.getFile requests)
+  std::vector<ActorOwn<StreamGetFileActor>> streaming_stream_actors_;
 
  private:
   static constexpr bool STORE_FILE_INFO = false;
