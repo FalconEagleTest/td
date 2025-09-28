@@ -2972,13 +2972,26 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
 
   // Create a dummy file content to return the requested bytes
   // In a complete implementation, this would make a direct API call to Telegram
-  // For now, we'll simulate successful streaming by returning empty data to test the flow
-  LOG(INFO) << "STREAMING: Would download file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
+  // STREAMING IMPLEMENTATION: Download only the specific file part needed
+  LOG(INFO) << "STREAMING: Downloading file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
   
-  // TODO: Implement actual Telegram API call here
-  // This is where we'd call telegram::td_api::downloadFile with precise offset/count
-  // For testing, return empty string to verify the streaming path works
-  promise.set_value(string(count, '\0'));  // Temporary: return zeros for testing
+  // Use TDLib's download system to get only the specific part we need
+  // This will download from Telegram servers directly to memory
+  auto download_promise = PromiseCreator::lambda([promise = std::move(promise), offset, count](Result<string> result) mutable {
+    if (result.is_error()) {
+      LOG(ERROR) << "STREAMING: Download failed: " << result.error();
+      promise.set_error(result.move_as_error());
+      return;
+    }
+    
+    auto data = result.move_as_ok();
+    LOG(INFO) << "STREAMING: Successfully downloaded " << data.size() << " bytes";
+    promise.set_value(std::move(data));
+  });
+
+  // Download the specific file part using the existing download infrastructure
+  // This creates a temporary download that gets only the bytes we need
+  download_file_impl(file_id, 1, offset, count, true, std::move(download_promise));
 }
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {
