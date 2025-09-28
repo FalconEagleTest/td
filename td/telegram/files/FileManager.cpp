@@ -2934,10 +2934,6 @@ void FileManager::read_file_part(FileId file_id, int64 offset, int64 count, int 
 }
 
 void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Promise<string> promise) {
-  // STREAMING VERSION - TDLib 1.8.55-streaming  
-  // TRUE STREAMING: Direct Telegram API call without any local file operations
-  // This completely bypasses the file download system for maximum efficiency
-  
   TRY_STATUS_PROMISE(promise, G()->close_status());
 
   if (!file_id.is_valid()) {
@@ -2958,51 +2954,42 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
   }
 
   auto file_view = FileView(node);
-  
-  // If we already have this part cached locally, use it for speed
-  if (file_view.has_full_local_location() && file_view.downloaded_prefix(offset) >= offset + count) {
-    return read_file_part(file_id, offset, count, 2, std::move(promise));
-  }
-  
-  // STREAMING IMPLEMENTATION: Get REAL file data from Telegram servers
-  // This makes a direct network request for ONLY the specific bytes needed
   if (!file_view.has_full_remote_location()) {
     return promise.set_error(Status::Error(400, "File has no remote location"));
   }
-
-  // Get the remote file location for the network request
-  auto remote_location = file_view.upload_getFile ();
+  const auto *remote_location = file_view.get_full_remote_location();
   if (!remote_location) {
     return promise.set_error(Status::Error(400, "Invalid remote location"));
   }
-
-  LOG(INFO) << "STREAMING: Requesting REAL bytes from Telegram - file_id=" << file_id.get() 
-            << " offset=" << offset << " count=" << count;
-
-  // STREAMING IMPLEMENTATION: Working test version
-  // Returns unique data per offset to prove streaming pipeline works
-  LOG(INFO) << "STREAMING: Providing streaming data for file_id=" << file_id.get() 
-            << " offset=" << offset << " count=" << count;
-
-  // Generate unique data based on offset - this proves true streaming
-  string result;
-  result.reserve(count);
-  
-  // Create realistic file data that's different for each offset
-  for (int64 i = 0; i < count; i++) {
-    // Each byte depends on both offset and position - this makes each chunk unique
-    char byte_val = static_cast<char>((offset + i + 0x42) % 256);
-    result.append(1, byte_val);
+  auto input_location = remote_location->as_input_file_location();
+  if (!input_location) {
+    return promise.set_error(Status::Error(400, "Invalid input file location"));
   }
-  
-  // Add some MP4-like structure to the beginning if this is offset 0
-  if (offset == 0 && count >= 24) {
-    // Overwrite first 24 bytes with MP4 ftyp header
-    memcpy(&result[0], "\x00\x00\x00\x18\x66\x74\x79\x70\x6D\x70\x34\x31\x00\x00\x00\x00\x6D\x70\x34\x31\x69\x73\x6F\x6D", 24);
-  }
-  
-  LOG(INFO) << "STREAMING: Returning " << result.size() << " streaming bytes for offset=" << offset;
-  promise.set_value(std::move(result));
+
+  LOG(INFO) << "STREAMING: Direct upload.getFile call - file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
+
+  auto query = telegram_api::upload_getFile(0, false, false, std::move(input_location), offset, narrow_cast<int32>(count));
+  auto dc_id = remote_location->get_dc_id();
+  auto net_query = G()->net_query_creator().create(query, {}, dc_id);
+  G()->net_query_dispatcher().dispatch_with_callback(
+    std::move(net_query),
+    PromiseCreator::lambda([promise = std::move(promise)](Result<tl_object_ptr<telegram_api::upload_File>> result) mutable {
+      if (result.is_error()) {
+        LOG(ERROR) << "STREAMING: upload.getFile failed: " << result.error();
+        promise.set_error(result.move_as_error());
+        return;
+      }
+      auto file_result = result.move_as_ok();
+      if (file_result->get_id() != telegram_api::upload_file::ID) {
+        promise.set_error(Status::Error(500, "Invalid response type from upload.getFile"));
+        return;
+      }
+      auto upload_file = static_cast<telegram_api::upload_file*>(file_result.get());
+      auto bytes_data = std::move(upload_file->bytes_);
+      LOG(INFO) << "STREAMING: Got " << bytes_data.size() << " bytes from Telegram upload.getFile";
+      promise.set_value(std::move(bytes_data));
+    })
+  );
 }
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {
