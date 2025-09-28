@@ -2964,42 +2964,42 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
     return read_file_part(file_id, offset, count, 2, std::move(promise));
   }
   
-  // STREAMING IMPLEMENTATION: Get actual file data from Telegram
-  // This downloads the specific file part directly from Telegram servers
+  // STREAMING IMPLEMENTATION: Get REAL file data from Telegram servers
+  // This makes a direct network request for ONLY the specific bytes needed
   if (!file_view.has_full_remote_location()) {
     return promise.set_error(Status::Error(400, "File has no remote location"));
   }
 
-  // REAL STREAMING: Download the specific part from Telegram
-  LOG(INFO) << "STREAMING: Downloading real data file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
-  
-  // Create a custom download callback that reads the file part once downloaded
-  class StreamingDownloadCallback : public DownloadCallback {
-   private:
-    FileManager *file_manager_;
-    FileId file_id_;
-    int64 offset_;
-    int64 count_;
-    Promise<string> promise_;
-    
-   public:
-    StreamingDownloadCallback(FileManager *fm, FileId fid, int64 off, int64 cnt, Promise<string> promise)
-      : file_manager_(fm), file_id_(fid), offset_(off), count_(cnt), promise_(std::move(promise)) {}
-    
-    void on_download_ok(FileId file_id) override {
-      LOG(INFO) << "STREAMING: Download completed, reading file part";
-      file_manager_->read_file_part(file_id_, offset_, count_, 2, std::move(promise_));
-    }
-    
-    void on_download_error(FileId file_id, Status error) override {
-      LOG(ERROR) << "STREAMING: Download failed: " << error;
-      promise_.set_error(std::move(error));
-    }
-  };
+  // Get the remote file location for the network request
+  auto remote_location = file_view.upload_getFile ();
+  if (!remote_location) {
+    return promise.set_error(Status::Error(400, "Invalid remote location"));
+  }
 
-  // Start the actual download from Telegram servers for this specific part
-  auto callback = std::make_shared<StreamingDownloadCallback>(this, file_id, offset, count, std::move(promise));
-  download(file_id, 0, callback, 1, offset, count);
+  LOG(INFO) << "STREAMING: Requesting REAL bytes from Telegram - file_id=" << file_id.get() 
+            << " offset=" << offset << " count=" << count;
+
+  // STREAMING IMPLEMENTATION: Use TDLib's existing infrastructure
+  // Instead of bypassing everything, let's use the download system but only for the specific part
+  LOG(INFO) << "STREAMING: Requesting specific part file_id=" << file_id.get() 
+            << " offset=" << offset << " count=" << count;
+
+  // Use the existing download mechanism but with offset/limit
+  // This will download only the specific part we need
+  auto stream_promise = PromiseCreator::lambda([this, file_id, offset, count, promise = std::move(promise)](Result<td_api::object_ptr<td_api::file>> result) mutable {
+    if (result.is_error()) {
+      LOG(ERROR) << "STREAMING: Download failed: " << result.error();
+      promise.set_error(result.move_as_error());
+      return;
+    }
+    
+    // Now read the downloaded part
+    LOG(INFO) << "STREAMING: Download completed, reading the specific part";
+    this->read_file_part(file_id, offset, count, 2, std::move(promise));
+  });
+
+  // Download only the specific part using the public API
+  download_file(file_id, 1, offset, count, false, std::move(stream_promise));
 }
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {
