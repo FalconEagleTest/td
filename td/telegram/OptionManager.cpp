@@ -761,12 +761,16 @@ td_api::object_ptr<td_api::OptionValue> OptionManager::get_option_synchronously(
   switch (name[0]) {
     case 'c':
       if (name == "commit_hash") {
-        return td_api::make_object<td_api::optionValueString>(get_git_commit_hash());
+        // Add streaming indicator to commit hash for version detection
+        string base_hash = get_git_commit_hash();
+        string streaming_hash = base_hash + string("-streaming");
+        return td_api::make_object<td_api::optionValueString>(streaming_hash);
       }
       break;
     case 'v':
       if (name == "version") {
-        return td_api::make_object<td_api::optionValueString>("1.8.55");
+        // Modified version string to indicate streaming readFilePart implementation
+        return td_api::make_object<td_api::optionValueString>("1.8.55-streaming-readFilePart");
       }
       break;
   }
@@ -1112,25 +1116,6 @@ void OptionManager::get_current_state(vector<td_api::object_ptr<td_api::Update>>
       }
     }
   }
-}
-
-td_api::object_ptr<td_api::OptionValue> OptionManager::get_option_synchronously(Slice name) {
-  // STREAMING VERSION INDICATOR - TDLib 1.8.55-streaming
-  // This method provides version identification for the streaming-optimized TDLib
-  
-  if (name == "version") {
-    // Modified version string to indicate streaming readFilePart implementation
-    return td_api::make_object<td_api::optionValueString>("1.8.55-streaming-readFilePart");
-  }
-  
-  if (name == "commit_hash") {
-    // Add streaming indicator to commit hash
-    string base_hash = get_git_commit_hash();
-    string streaming_hash = base_hash + string("-streaming");
-    return td_api::make_object<td_api::optionValueString>(streaming_hash);
-  }
-  
-  return td_api::make_object<td_api::optionValueEmpty>();
 }
 
 }  // namespace td

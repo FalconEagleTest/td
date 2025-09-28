@@ -2983,7 +2983,6 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
   // This uses the existing downloadFile infrastructure but with specific offset/limit
   download_file(file_id, 32, offset, count, false, std::move(streaming_promise));
 }
-}
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {
   LOG(INFO) << "Trying to delete file " << file_id << " from " << source;
