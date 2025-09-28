@@ -15,6 +15,7 @@
 #include "td/telegram/files/FileLocation.h"
 #include "td/telegram/files/FileLocation.hpp"
 #include "td/telegram/Global.h"
+#include "td/telegram/net/NetQueryDispatcher.h"
 #include "td/telegram/logevent/LogEvent.h"
 #include "td/telegram/misc.h"
 #include "td/telegram/SecureStorage.h"
@@ -2985,9 +2986,9 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
         return;
       }
       auto upload_file = static_cast<telegram_api::upload_file*>(file_result.get());
-      auto bytes_data = std::move(upload_file->bytes_);
-      LOG(INFO) << "STREAMING: Got " << bytes_data.size() << " bytes from Telegram upload.getFile";
-      promise.set_value(std::move(bytes_data));
+  auto bytes_data = std::move(upload_file->bytes_);
+  LOG(INFO) << "STREAMING: Got " << bytes_data.size() << " bytes from Telegram upload.getFile";
+  promise.set_value(bytes_data.as_slice().str());
     })
   );
 }
