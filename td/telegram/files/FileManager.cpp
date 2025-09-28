@@ -22,6 +22,8 @@
 #include "td/telegram/net/NetQuery.h"
 #include "td/actor/actor.h"
 
+namespace td { // ensure we are in td namespace for forward declaration match if not already
+
 // Minimal one-shot actor to fetch upload.getFile bytes using existing TDLib helpers
 class StreamGetFileActor final : public Actor, public NetQueryCallback {
  public:
@@ -77,6 +79,8 @@ class StreamGetFileActor final : public Actor, public NetQueryCallback {
   FullRemoteFileLocation remote_;
   Promise<string> promise_;
 };
+
+} // namespace td
 #include "td/telegram/logevent/LogEvent.h"
 #include "td/telegram/misc.h"
 #include "td/telegram/SecureStorage.h"
@@ -3031,7 +3035,7 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
   LOG(INFO) << "STREAMING: Direct upload.getFile call - file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
 
   auto actor = create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, narrow_cast<int32>(count),
-                                                remote_location->as_input_full(), std::move(promise));
+                                                *remote_location, std::move(promise));
   streaming_stream_actors_.push_back(std::move(actor));
 }
 

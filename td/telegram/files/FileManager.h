@@ -393,6 +393,8 @@ class FileView {
   ConstFileNodePtr node_{};
 };
 
+class StreamGetFileActor; // forward declaration for streaming helper
+
 class FileManager final : public Actor {
  public:
   class DownloadCallback {
