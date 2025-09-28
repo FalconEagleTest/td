@@ -242,25 +242,20 @@ jobs:
           echo "Commit: ${{ github.sha }}"
           echo "Repository: ${{ github.repository }}"
           
-      - name: Build TDLib for Windows
+      - name: Build TDLib for Windows (incremental)
         run: |
           if (!(Test-Path "build")) { New-Item -Path "build" -ItemType Directory }
           cd build
-          
-          # Configure CMake (only if not cached or configuration changed)
-          if (!(Test-Path "CMakeCache.txt") -or "${{ steps.cache-cmake.outputs.cache-hit }}" -ne "true") {
+          if (!(Test-Path "CMakeCache.txt")) {
             Write-Host "🔧 Configuring CMake..."
             cmake -A x64 -DCMAKE_INSTALL_PREFIX:PATH=../tdlib -DCMAKE_TOOLCHAIN_FILE:FILEPATH=../vcpkg/scripts/buildsystems/vcpkg.cmake -DTD_VERSION_EXTRA="streaming-readFilePart" ..
           } else {
             Write-Host "⚡ Using cached CMake configuration"
           }
-          
           Write-Host "🏗️ Building TDLib (incremental)..."
-          cmake --build . --config Release
-          
+          cmake --build . --config Release --parallel
           Write-Host "📦 Installing TDLib..."
           cmake --build . --config Release --target install
-          
           Write-Host "📁 Checking build output..."
           Get-ChildItem -Recurse ../tdlib
           
