@@ -16,6 +16,7 @@
 #include "td/telegram/files/FileLocation.hpp"
 #include "td/telegram/Global.h"
 #include "td/telegram/net/NetQueryDispatcher.h"
+#include "td/telegram/net/NetQuery.h"
 #include "td/actor/actor.h"
 // Handler for upload.getFile streaming result
 class UploadGetFileCallback : public td::NetQueryCallback {
@@ -2999,7 +3000,7 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
   auto net_query = G()->net_query_creator().create(query, {}, dc_id);
   G()->net_query_dispatcher().dispatch_with_callback(
     std::move(net_query),
-    td::create_actor_shared<UploadGetFileCallback>("UploadGetFileCallback", std::move(promise))
+    create_actor_shared<UploadGetFileCallback>("UploadGetFileCallback", std::move(promise))
   );
 }
 
