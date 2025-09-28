@@ -1,3 +1,5 @@
+#include "td/telegram/telegram_api.h"
+using ::create_actor_shared;
 //
 // Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
@@ -28,11 +30,7 @@ class UploadGetFileCallback : public td::NetQueryCallback {
       promise_.set_error(net_query->move_as_error());
       return;
     }
-    auto result = fetch_result<td::telegram_api::upload_getFile>(net_query->move_as_ok());
-    if (result.is_error()) {
-      promise_.set_error(result.move_as_error());
-      return;
-    }
+    TRY_RESULT(result, fetch_result<td::telegram_api::upload_getFile>(net_query->move_as_ok()));
     auto file_result = result.move_as_ok();
     if (file_result->get_id() != td::telegram_api::upload_file::ID) {
       promise_.set_error(td::Status::Error(500, "Invalid response type from upload.getFile"));
