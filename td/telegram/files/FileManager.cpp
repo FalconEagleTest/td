@@ -22,26 +22,16 @@
 #include "td/telegram/net/NetQuery.h"
 #include "td/actor/actor.h"
 
-namespace td { // ensure we are in td namespace for forward declaration match if not already
-
-// Minimal one-shot actor to fetch upload.getFile bytes using existing TDLib helpers
-class StreamGetFileActor final : public Actor, public NetQueryCallback {
+// StreamGetFileActor definition placed after required includes; only inherit NetQueryCallback (already an Actor)
+namespace td {
+class StreamGetFileActor final : public NetQueryCallback {
  public:
   StreamGetFileActor(FileId file_id, int64 offset, int32 length, FullRemoteFileLocation remote,
                      Promise<string> promise)
-      : file_id_(file_id)
-      , offset_(offset)
-      , length_(length)
-      , remote_(std::move(remote))
-      , promise_(std::move(promise)) {
+      : file_id_(file_id), offset_(offset), length_(length), remote_(std::move(remote)), promise_(std::move(promise)) {
   }
 
   void start_up() override {
-    if (!remote_.is_valid()) {
-      promise_.set_error(Status::Error(400, "Invalid remote location"));
-      stop();
-      return;
-    }
     auto input_location = remote_.as_input_file_location();
     if (!input_location) {
       promise_.set_error(Status::Error(400, "Can't create input location"));
@@ -79,7 +69,6 @@ class StreamGetFileActor final : public Actor, public NetQueryCallback {
   FullRemoteFileLocation remote_;
   Promise<string> promise_;
 };
-
 } // namespace td
 #include "td/telegram/logevent/LogEvent.h"
 #include "td/telegram/misc.h"
