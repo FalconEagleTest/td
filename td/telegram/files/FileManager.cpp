@@ -1,3 +1,18 @@
+#include <tuple>
+#include <map>
+
+// Structure to uniquely identify a read_file_part request
+struct PendingReadFilePartKey {
+  FileId file_id;
+  int64 offset;
+  int64 count;
+  bool operator<(const PendingReadFilePartKey &other) const {
+    return std::tie(file_id, offset, count) < std::tie(other.file_id, other.offset, other.count);
+  }
+};
+
+// Map to group pending read_file_part requests
+static std::map<PendingReadFilePartKey, std::vector<Promise<string>>> pending_read_file_part_requests_;
 //
 // Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
@@ -2880,14 +2895,27 @@ void FileManager::read_file_part(FileId file_id, int64 offset, int64 count, int 
 
   auto file_view = FileView(node);
 
+  // Group requests for the same file/offset/count
+  PendingReadFilePartKey key{file_id, offset, count};
+  auto &pending_promises = pending_read_file_part_requests_[key];
+  pending_promises.push_back(std::move(promise));
+  if (pending_promises.size() > 1) {
+    // Already in progress, just queue the promise
+    return;
+  }
+
   if (count == 0) {
     count = file_view.downloaded_prefix(offset);
     if (count == 0) {
-      return promise.set_value(string());
+      for (auto &p : pending_read_file_part_requests_[key]) p.set_value(string());
+      pending_read_file_part_requests_.erase(key);
+      return;
     }
   }
   if (count >= static_cast<int64>(std::numeric_limits<size_t>::max() / 2 - 1)) {
-    return promise.set_error(400, "Part length is too big");
+    for (auto &p : pending_read_file_part_requests_[key]) p.set_error(400, "Part length is too big");
+    pending_read_file_part_requests_.erase(key);
+    return;
   }
 
   const string *path = nullptr;
@@ -2897,25 +2925,29 @@ void FileManager::read_file_part(FileId file_id, int64 offset, int64 count, int 
     // Data is available locally, read from disk
     path = &full_local_location->path_;
     if (!begins_with(*path, get_files_dir(file_view.get_type()))) {
-      return promise.set_error(400, "File is not inside the cache");
+      for (auto &p : pending_read_file_part_requests_[key]) p.set_error(400, "File is not inside the cache");
+      pending_read_file_part_requests_.erase(key);
+      return;
     }
     auto read_file_part_promise =
-        PromiseCreator::lambda([actor_id = actor_id(this), file_id, offset, count, left_tries, is_partial,
-                                promise = std::move(promise)](Result<string> r_bytes) mutable {
+        PromiseCreator::lambda([actor_id = actor_id(this), file_id, offset, count, left_tries, is_partial, key](Result<string> r_bytes) mutable {
+          auto &pending = pending_read_file_part_requests_[key];
           if (r_bytes.is_error()) {
             LOG(INFO) << "Failed to read file bytes: " << r_bytes.error();
             if (left_tries == 1 || !is_partial) {
-              return promise.set_error(400, "Failed to read the file");
+              for (auto &p : pending) p.set_error(400, "Failed to read the file");
+              pending_read_file_part_requests_.erase(key);
+              return;
             }
             create_actor<SleepActor>("RepeatReadFilePartActor", 0.01,
-                                     PromiseCreator::lambda([actor_id, file_id, offset, count, left_tries,
-                                                             promise = std::move(promise)](Unit) mutable {
+                                     PromiseCreator::lambda([actor_id, file_id, offset, count, left_tries, key](Unit) mutable {
                                        send_closure(actor_id, &FileManager::read_file_part, file_id, offset, count,
-                                                    left_tries - 1, std::move(promise));
+                                                    left_tries - 1, std::move(pending_read_file_part_requests_[key].back()));
                                      }))
                 .release();
           } else {
-            promise.set_value(r_bytes.move_as_ok());
+            for (auto &p : pending) p.set_value(r_bytes.move_as_ok());
+            pending_read_file_part_requests_.erase(key);
           }
         });
     send_closure(file_load_manager_, &FileLoadManager::read_file_part, *path, offset, count,
@@ -2924,11 +2956,29 @@ void FileManager::read_file_part(FileId file_id, int64 offset, int64 count, int 
   }
 
   // Data is not available locally, trigger download for the requested range (permissive)
-  auto streaming_callback = std::make_shared<StreamingDownloadFileCallback>(std::move(promise), offset, count);
-  download(file_id, 0, streaming_callback, 32, offset, count,
-           PromiseCreator::lambda([streaming_callback](Result<td_api::object_ptr<td_api::file>> result) {
+  // Use a custom callback to fulfill all grouped promises
+  struct GroupedStreamingCallback final : public FileManager::DownloadCallback {
+    PendingReadFilePartKey key_;
+    int64 offset_;
+    int64 count_;
+    GroupedStreamingCallback(PendingReadFilePartKey key, int64 offset, int64 count)
+      : key_(key), offset_(offset), count_(count) {}
+    void on_download_ok(FileId file_id) final {
+      send_closure(G()->file_manager(), &FileManager::read_file_part, file_id, offset_, count_, 2, std::move(pending_read_file_part_requests_[key_].back()));
+    }
+    void on_download_error(FileId, Status error) final {
+      auto &pending = pending_read_file_part_requests_[key_];
+      int code = error.code();
+      std::string message = error.message();
+      for (auto &p : pending) p.set_error(code, PSLICE() << "Failed to download file part: " << message);
+      pending_read_file_part_requests_.erase(key_);
+    }
+  };
+  auto grouped_callback = std::make_shared<GroupedStreamingCallback>(key, offset, count);
+  download(file_id, 0, grouped_callback, 32, offset, count,
+           PromiseCreator::lambda([grouped_callback](Result<td_api::object_ptr<td_api::file>> result) {
              if (result.is_error()) {
-               streaming_callback->on_download_error(result.error());
+               grouped_callback->on_download_error(FileId(), result.error());
              }
            }));
 }
