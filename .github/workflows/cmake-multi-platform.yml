@@ -1,3 +1,4 @@
+
 name: tdlib-build
 
 on:
@@ -44,12 +45,21 @@ jobs:
         run: |
           sudo apt-get install -y make git zlib1g-dev libssl-dev gperf cmake clang libc++-dev libc++abi-dev ninja-build
   
-      - name: Clone TDLib
+      - name: Clone or update TDLib
         run: |
-          git clone https://github.com/FalconEagleTest/td.git
-          cd td
-          git checkout master
-          git show --summary
+          if [ -d td ]; then
+            cd td
+            git pull
+            git checkout master
+            git show --summary
+            cd ..
+          else
+            git clone https://github.com/FalconEagleTest/td.git
+            cd td
+            git checkout master
+            git show --summary
+            cd ..
+          fi
   
       - name: Fetch Android SDK
         run: |
@@ -85,7 +95,7 @@ jobs:
 
       - name: Clone TDLib
         run: |
-          git clone https://github.com/tdlib/td.git
+          git clone https://github.com/FalconEagleTest/td.git
           cd td
           git checkout master
           git show --summary
@@ -112,7 +122,7 @@ jobs:
 
       - name: Clone TDLib
         run: |
-          git clone https://github.com/tdlib/td.git
+          git clone https://github.com/FalconEagleTest/td.git
           cd td
           git checkout master
           git show --summary
@@ -139,7 +149,7 @@ jobs:
 
       - name: Clone TDLib
         run: |
-          git clone https://github.com/tdlib/td.git
+          git clone https://github.com/FalconEagleTest/td.git
           cd td
           git checkout master
           git show --summary
@@ -165,29 +175,45 @@ jobs:
       - uses: actions/checkout@v2
       - name: Clone TDLib
         run: |
-          git clone https://github.com/tdlib/td.git
+          git clone https://github.com/FalconEagleTest/td.git
           cd td
           git checkout master
           git show --summary
 
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        id: cache-vcpkg
+        if: github.event.inputs.force_rebuild_cache != 'true'
+        with:
+          path: |
+            vcpkg
+            vcpkg_installed
+          key: ${{ runner.os }}-vcpkg-stable-v1
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-stable-
+            ${{ runner.os }}-vcpkg-
+
       - name: Setup vcpkg
         run: |
-          cd td
           git clone https://github.com/Microsoft/vcpkg.git
           cd vcpkg
           ./bootstrap-vcpkg.bat
           ./vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows
 
+      - name: List directory before CMake
+        run: |
+          dir
+          dir CMakeLists.txt
+          dir ..
       - name: Build TDLib for Windows
         run: |
-          cd td
           mkdir build
           cd build
           cmake -A x64 -DCMAKE_INSTALL_PREFIX:PATH=../tdlib -DCMAKE_TOOLCHAIN_FILE:FILEPATH=../vcpkg/scripts/buildsystems/vcpkg.cmake ..
           cmake --build . --target install --config Release
       - name: zip
         run: |
-          cd td/tdlib/bin
+          cd tdlib/bin
           ls
           mv libcrypto-3-x64.dll libcrypto-1_1.dll
           mv libssl-3-x64.dll libssl-1_1.dll
@@ -196,30 +222,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tdlib-windows
-          path: td/tdlib/bin/dlls.zip
-
-  release:
-    needs: [build-android, build-macos-intel, build-ios, build-linux-x64, build-windows-x64]
-    if: always()
-    runs-on: ubuntu-20.04
-    steps:
-      - name: Get current date/time
-        id: datetime
-        run: echo "DATE=$(date -u +'%Y-%m-%d_%H-%M')" >> $GITHUB_ENV
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: List downloaded artifacts
-        run: ls -R artifacts
-
-      - name: Create a GitHub Release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: tdlib-${{ env.DATE }}
-          name: TDLib Build ${{ env.DATE }}
-          body: "TDLib build release containing all selected platform binaries."
-          token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: "artifacts/**/**"
+          path: tdlib/bin/dlls.zip

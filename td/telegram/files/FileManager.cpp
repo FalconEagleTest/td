@@ -2885,9 +2885,6 @@ void FileManager::read_file_part(FileId file_id, int64 offset, int64 count, int 
     if (count == 0) {
       return promise.set_value(string());
     }
-  } else if (file_view.downloaded_prefix(offset) < count) {
-    // TODO this check is safer to do in another thread
-    return promise.set_error(400, "There is not enough downloaded bytes in the file to read");
   }
   if (count >= static_cast<int64>(std::numeric_limits<size_t>::max() / 2 - 1)) {
     return promise.set_error(400, "Part length is too big");
@@ -2896,41 +2893,44 @@ void FileManager::read_file_part(FileId file_id, int64 offset, int64 count, int 
   const string *path = nullptr;
   bool is_partial = false;
   const auto *full_local_location = file_view.get_full_local_location();
-  if (full_local_location != nullptr) {
+  if (full_local_location != nullptr && file_view.downloaded_prefix(offset) >= count) {
+    // Data is available locally, read from disk
     path = &full_local_location->path_;
     if (!begins_with(*path, get_files_dir(file_view.get_type()))) {
       return promise.set_error(400, "File is not inside the cache");
     }
-  } else {
-    CHECK(node->local_.type() == LocalFileLocation::Type::Partial);
-    path = &node->local_.partial().path_;
-    is_partial = true;
+    auto read_file_part_promise =
+        PromiseCreator::lambda([actor_id = actor_id(this), file_id, offset, count, left_tries, is_partial,
+                                promise = std::move(promise)](Result<string> r_bytes) mutable {
+          if (r_bytes.is_error()) {
+            LOG(INFO) << "Failed to read file bytes: " << r_bytes.error();
+            if (left_tries == 1 || !is_partial) {
+              return promise.set_error(400, "Failed to read the file");
+            }
+            create_actor<SleepActor>("RepeatReadFilePartActor", 0.01,
+                                     PromiseCreator::lambda([actor_id, file_id, offset, count, left_tries,
+                                                             promise = std::move(promise)](Unit) mutable {
+                                       send_closure(actor_id, &FileManager::read_file_part, file_id, offset, count,
+                                                    left_tries - 1, std::move(promise));
+                                     }))
+                .release();
+          } else {
+            promise.set_value(r_bytes.move_as_ok());
+          }
+        });
+    send_closure(file_load_manager_, &FileLoadManager::read_file_part, *path, offset, count,
+                 std::move(read_file_part_promise));
+    return;
   }
 
-  auto read_file_part_promise =
-      PromiseCreator::lambda([actor_id = actor_id(this), file_id, offset, count, left_tries, is_partial,
-                              promise = std::move(promise)](Result<string> r_bytes) mutable {
-        if (r_bytes.is_error()) {
-          LOG(INFO) << "Failed to read file bytes: " << r_bytes.error();
-          if (left_tries == 1 || !is_partial) {
-            return promise.set_error(400, "Failed to read the file");
-          }
-
-          // the temporary file could be moved from temp to persistent directory
-          // we need to wait for the corresponding update and repeat the reading
-          create_actor<SleepActor>("RepeatReadFilePartActor", 0.01,
-                                   PromiseCreator::lambda([actor_id, file_id, offset, count, left_tries,
-                                                           promise = std::move(promise)](Unit) mutable {
-                                     send_closure(actor_id, &FileManager::read_file_part, file_id, offset, count,
-                                                  left_tries - 1, std::move(promise));
-                                   }))
-              .release();
-        } else {
-          promise.set_value(r_bytes.move_as_ok());
-        }
-      });
-  send_closure(file_load_manager_, &FileLoadManager::read_file_part, *path, offset, count,
-               std::move(read_file_part_promise));
+  // Data is not available locally, trigger download for the requested range (permissive)
+  auto streaming_callback = std::make_shared<StreamingDownloadFileCallback>(std::move(promise), offset, count);
+  download(file_id, 0, streaming_callback, 32, offset, count,
+           PromiseCreator::lambda([streaming_callback](Result<td_api::object_ptr<td_api::file>> result) {
+             if (result.is_error()) {
+               streaming_callback->on_download_error(result.error());
+             }
+           }));
 }
 
 void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Promise<string> promise) {
