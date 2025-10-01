@@ -1,5 +1,7 @@
 #include <tuple>
 #include <map>
+#include <vector>
+#include <string>
 
 // Structure to uniquely identify a read_file_part request
 struct PendingReadFilePartKey {
@@ -12,7 +14,7 @@ struct PendingReadFilePartKey {
 };
 
 // Map to group pending read_file_part requests
-static std::map<PendingReadFilePartKey, std::vector<Promise<string>>> pending_read_file_part_requests_;
+static std::map<PendingReadFilePartKey, std::vector<td::Promise<td::string>>> pending_read_file_part_requests_;
 //
 // Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
