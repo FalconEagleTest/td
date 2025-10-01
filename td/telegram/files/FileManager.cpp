@@ -5,6 +5,7 @@
 #include <string>
 
 
+
 namespace td {
 
 // Structure to uniquely identify a read_file_part request
@@ -19,6 +20,7 @@ struct PendingReadFilePartKey {
 
 // Map to group pending read_file_part requests
 static std::map<PendingReadFilePartKey, std::vector<Promise<string>>> pending_read_file_part_requests_;
+
 
 //
 // Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
@@ -2148,27 +2150,12 @@ static int merge_choose_generate_location(const unique_ptr<FullGenerateFileLocat
   return 2;
 }
 
-// -1 -- error
-static int merge_choose_size(int64 x, int64 y) {
-  if (x == 0) {
-    return 1;
-  }
-  if (y == 0) {
-    return 0;
-  }
-  if (x != y) {
-    return -1;
-  }
-  return 2;
-}
+// STL includes
+#include <tuple>
+#include <map>
+#include <vector>
+#include <string>
 
-static int merge_choose_expected_size(int64 x, int64 y) {
-  if (x == 0) {
-    return 1;
-  }
-  if (y == 0) {
-    return 0;
-  }
   return 2;
 }
 
@@ -2183,6 +2170,38 @@ static int merge_choose_owner(DialogId x_owner_dialog_id, DialogId y_owner_dialo
   if (x_owner_dialog_id.is_valid() != y_owner_dialog_id.is_valid()) {
     return x_owner_dialog_id.is_valid() < y_owner_dialog_id.is_valid();
   }
+#include "td/telegram/files/FileManager.h"
+#include "td/telegram/ConfigManager.h"
+#include "td/telegram/DownloadManager.h"
+#include "td/telegram/FileReferenceManager.h"
+#include "td/telegram/files/FileData.h"
+#include "td/telegram/files/FileDb.h"
+#include "td/telegram/files/FileLoaderUtils.h"
+#include "td/telegram/files/FileLocation.h"
+#include "td/telegram/files/FileLocation.hpp"
+#include "td/telegram/Global.h"
+#include "td/telegram/logevent/LogEvent.h"
+#include "td/telegram/misc.h"
+#include "td/telegram/SecureStorage.h"
+#include "td/telegram/TdDb.h"
+#include "td/telegram/Version.h"
+#include "td/actor/SleepActor.h"
+#include "td/utils/algorithm.h"
+#include "td/utils/base64.h"
+#include "td/utils/crypto.h"
+#include "td/utils/filesystem.h"
+#include "td/utils/format.h"
+#include "td/utils/HttpUrl.h"
+#include "td/utils/logging.h"
+#include "td/utils/misc.h"
+#include "td/utils/PathView.h"
+#include "td/utils/port/Stat.h"
+#include "td/utils/ScopeGuard.h"
+#include "td/utils/SliceBuilder.h"
+#include "td/utils/StringBuilder.h"
+#include "td/utils/Time.h"
+#include "td/utils/tl_helpers.h"
+#include "td/utils/tl_parsers.h"
   return 2;
 }
 
