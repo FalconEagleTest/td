@@ -45,12 +45,19 @@ class StreamGetFileActor final : public NetQueryCallback {
 
   void on_result(NetQueryPtr net_query) override {
     if (net_query->is_error()) {
-      promise_.set_error(net_query->move_as_error());
+      auto error = net_query->move_as_error();
+      LOG(ERROR) << "STREAMING: upload.getFile failed - file_id=" << file_id_.get() 
+                 << " offset=" << offset_ << " length=" << length_ 
+                 << " error=" << error.code() << " message=" << error.message();
+      promise_.set_error(std::move(error));
       stop();
       return;
     }
     TRY_RESULT_PROMISE(promise_, file_base, fetch_result<telegram_api::upload_getFile>(net_query->ok()));
     auto *upload_file = static_cast<telegram_api::upload_file *>(file_base.get());
+    LOG(INFO) << "STREAMING: upload.getFile success - file_id=" << file_id_.get() 
+              << " offset=" << offset_ << " length=" << length_ 
+              << " received_bytes=" << upload_file->bytes_.size();
     promise_.set_value(upload_file->bytes_.as_slice().str());
     stop();
   }
@@ -3004,6 +3011,9 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
   if (count <= 0) {
     return promise.set_error(Status::Error(400, "Parameter count must be positive"));
   }
+  if (count > std::numeric_limits<int32>::max()) {
+    return promise.set_error(Status::Error(400, "Parameter count must not exceed 2147483647 bytes (Telegram API limit)"));
+  }
   if (count >= static_cast<int64>(std::numeric_limits<size_t>::max() / 2 - 1)) {
     return promise.set_error(Status::Error(400, "Part length is too big"));
   }
@@ -3021,9 +3031,28 @@ void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Pr
     return promise.set_error(Status::Error(400, "Invalid input file location"));
   }
 
-  LOG(INFO) << "STREAMING: Direct upload.getFile call - file_id=" << file_id.get() << " offset=" << offset << " count=" << count;
+  LOG(INFO) << "STREAMING: Direct upload.getFile call - file_id=" << file_id.get() << " offset=" << offset << " count=" << count
+            << " remote_dc=" << remote_location->get_dc_id() << " file_type=" << static_cast<int>(file_view.get_type());
 
-  auto actor = create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, narrow_cast<int32>(count),
+  // FIXED: Use safe chunk size that works reliably with Telegram API  
+  // Common working values: 64KB, 128KB, 256KB, 512KB
+  constexpr int64 SAFE_CHUNK_SIZE = 512 * 1024;  // 512KB - matches TDLib's MAX_PART_SIZE
+  
+  // Align count to safe boundaries and don't exceed chunk size
+  int64 safe_count = std::min(count, SAFE_CHUNK_SIZE);
+  
+  // Additional validation for common Telegram API constraints
+  if (offset % 1024 != 0) {
+    LOG(WARNING) << "STREAMING: Offset " << offset << " is not aligned to 1KB boundary";
+  }
+  if (safe_count % 1024 != 0) {
+    LOG(WARNING) << "STREAMING: Count " << safe_count << " is not aligned to 1KB boundary";  
+  }
+  if (safe_count > 1048576) { // 1MB
+    LOG(WARNING) << "STREAMING: Count " << safe_count << " exceeds 1MB, may cause server issues";
+  }
+
+  auto actor = create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, narrow_cast<int32>(safe_count),
                                                 *remote_location, std::move(promise));
   streaming_stream_actors_.push_back(std::move(actor));
 }
