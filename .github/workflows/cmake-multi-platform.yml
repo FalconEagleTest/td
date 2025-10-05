@@ -291,6 +291,23 @@ jobs:
           echo "Build date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
           echo "Commit: ${{ github.sha }}"
           echo "Repository: ${{ github.repository }}"
+          echo "Will verify OpenSSL + gperf availability before configure"
+
+      - name: Prepare OpenSSL/gperf environment
+        run: |
+          $triplet = "x64-windows"
+          if (-not $env:VCPKG_ROOT) { Write-Host "⚠️ VCPKG_ROOT not set" }
+          $root = Join-Path $env:VCPKG_ROOT "installed/$triplet"
+          if (Test-Path "$root/include/openssl/opensslv.h") {
+            Write-Host "✅ Found opensslv.h at $root/include/openssl" }
+          else { Write-Host "❌ Missing opensslv.h (OpenSSL not installed)"; Exit 1 }
+          echo "OPENSSL_ROOT_DIR=$root" >> $env:GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$root/include" >> $env:GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$root/lib" >> $env:GITHUB_ENV
+          $extraPaths = @("$root/tools/gperf","$root/tools","$root/bin")
+          $extraPaths | ForEach-Object { if (Test-Path $_) { $env:PATH = "$env:PATH;$_" } }
+          Write-Host "PATH after injection: $env:PATH"
+          gperf --version
           
       - name: Build TDLib for Windows (incremental)
         id: build
@@ -305,10 +322,29 @@ jobs:
               # Determine the correct vcpkg toolchain file path
               $vcpkgToolchain = if ($env:VCPKG_ROOT) { "$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" } else { "..\vcpkg\scripts\buildsystems\vcpkg.cmake" }
               Write-Host "Using vcpkg toolchain: $vcpkgToolchain"
-              cmake -A x64 -DCMAKE_INSTALL_PREFIX:PATH=../tdlib -DCMAKE_TOOLCHAIN_FILE:FILEPATH="$vcpkgToolchain" -DTD_VERSION_EXTRA="streaming-readFilePart" ..
+              $cmakeArgs = @(
+                '-A','x64',
+                '-DCMAKE_BUILD_TYPE=Release',
+                '-DCMAKE_INSTALL_PREFIX=../tdlib',
+                "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain",
+                "-DOPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR",
+                "-DOPENSSL_USE_STATIC_LIBS=ON",
+                '-DTD_VERSION_EXTRA=streaming-readFilePart'
+              )
+              cmake @cmakeArgs ..
               if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed" }
             } else {
               Write-Host "⚡ Using cached CMake configuration"
+              if (-not (Test-Path "$env:OPENSSL_ROOT_DIR/include/openssl/opensslv.h")) {
+                Write-Host "⚠️ Cached config but OpenSSL headers missing; removing cache" -ForegroundColor Yellow
+                cd ..
+                Remove-Item -Recurse -Force build
+                New-Item -Path build -ItemType Directory | Out-Null
+                cd build
+                $vcpkgToolchain = if ($env:VCPKG_ROOT) { "$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" } else { "..\vcpkg\scripts\buildsystems\vcpkg.cmake" }
+                cmake -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=../tdlib -DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain -DOPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR -DOPENSSL_USE_STATIC_LIBS=ON -DTD_VERSION_EXTRA=streaming-readFilePart ..
+                if ($LASTEXITCODE -ne 0) { throw "Reconfigure after cache purge failed" }
+              }
             }
             Write-Host "🏗️ Building TDLib (incremental)..."
             cmake --build . --config Release --parallel
