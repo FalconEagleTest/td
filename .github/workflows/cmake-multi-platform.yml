@@ -228,10 +228,32 @@ jobs:
       - name: Setup system vcpkg
         if: steps.check-vcpkg.outputs.SYSTEM_VCPKG == 'true'
         run: |
-          Write-Host "� Using system vcpkg..."
+          Write-Host "🔧 Using system vcpkg..."
           Write-Host "✅ Using system vcpkg at C:\vcpkg"
           echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
-          C:\vcpkg\vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows --triplet x64-windows
+          
+          # Check if packages are already installed
+          Write-Host "📋 Checking installed packages..."
+          $installedPackages = C:\vcpkg\vcpkg.exe list
+          $requiredPackages = @("gperf:x64-windows", "openssl:x64-windows", "zlib:x64-windows")
+          $missingPackages = @()
+          
+          foreach ($package in $requiredPackages) {
+            $packageName = $package.Split(':')[0]
+            if ($installedPackages -notmatch $packageName) {
+              $missingPackages += $package
+              Write-Host "❌ Missing: $package"
+            } else {
+              Write-Host "✅ Found: $package"
+            }
+          }
+          
+          if ($missingPackages.Count -gt 0) {
+            Write-Host "📦 Installing missing packages: $($missingPackages -join ', ')"
+            C:\vcpkg\vcpkg.exe install $missingPackages --triplet x64-windows
+          } else {
+            Write-Host "🎉 All required packages already installed - skipping installation"
+          }
 
       - name: Set vcpkg environment (cached local)
         if: steps.check-vcpkg.outputs.SYSTEM_VCPKG == 'false' && steps.cache-vcpkg.outputs.cache-hit == 'true'
