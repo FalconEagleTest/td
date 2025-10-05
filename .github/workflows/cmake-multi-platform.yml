@@ -296,18 +296,42 @@ jobs:
       - name: Prepare OpenSSL/gperf environment
         run: |
           $triplet = "x64-windows"
-          if (-not $env:VCPKG_ROOT) { Write-Host "⚠️ VCPKG_ROOT not set" }
+          if (-not $env:VCPKG_ROOT) {
+            if (Test-Path "C:\vcpkg") { $env:VCPKG_ROOT = "C:\vcpkg"; Write-Host "ℹ️ Using system VCPKG_ROOT=$env:VCPKG_ROOT" }
+            elseif (Test-Path "vcpkg") { $env:VCPKG_ROOT = (Resolve-Path "vcpkg").Path; Write-Host "ℹ️ Using local VCPKG_ROOT=$env:VCPKG_ROOT" }
+            else { Write-Host "⚠️ VCPKG_ROOT not set and vcpkg not found" }
+          }
           $root = Join-Path $env:VCPKG_ROOT "installed/$triplet"
+          $needInstall = $false
           if (Test-Path "$root/include/openssl/opensslv.h") {
             Write-Host "✅ Found opensslv.h at $root/include/openssl" }
-          else { Write-Host "❌ Missing opensslv.h (OpenSSL not installed)"; Exit 1 }
+          else {
+            Write-Host "❌ OpenSSL headers missing. Will attempt to install openssl, zlib, gperf via vcpkg." -ForegroundColor Yellow
+            $needInstall = $true
+          }
+          if ($needInstall -and (Test-Path "$env:VCPKG_ROOT/vcpkg.exe")) {
+            & "$env:VCPKG_ROOT/vcpkg.exe" install openssl:$triplet zlib:$triplet gperf:$triplet --triplet $triplet
+            if ($LASTEXITCODE -ne 0) { Write-Host "❌ vcpkg install failed"; Exit 1 }
+          }
+          if (-not (Test-Path "$root/include/openssl/opensslv.h")) {
+            Write-Host "❌ Still missing opensslv.h after install attempt" -ForegroundColor Red
+            Get-ChildItem -Recurse "$env:VCPKG_ROOT/installed" -Filter opensslv.h | Select-Object -First 20 | ForEach-Object { Write-Host "Found candidate: $_" }
+            Exit 1
+          }
           echo "OPENSSL_ROOT_DIR=$root" >> $env:GITHUB_ENV
           echo "OPENSSL_INCLUDE_DIR=$root/include" >> $env:GITHUB_ENV
           echo "OPENSSL_LIB_DIR=$root/lib" >> $env:GITHUB_ENV
           $extraPaths = @("$root/tools/gperf","$root/tools","$root/bin")
           $extraPaths | ForEach-Object { if (Test-Path $_) { $env:PATH = "$env:PATH;$_" } }
           Write-Host "PATH after injection: $env:PATH"
-          gperf --version
+          if (Get-Command gperf -ErrorAction SilentlyContinue) { gperf --version } else {
+            Write-Host "⚠️ gperf not found in PATH. Attempting Chocolatey install..." -ForegroundColor Yellow
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              choco install gperf -y
+              if (Get-Command gperf -ErrorAction SilentlyContinue) { gperf --version }
+              else { Write-Host "⚠️ gperf still not available after choco install" -ForegroundColor Yellow }
+            } else { Write-Host "⚠️ Chocolatey not available; continuing without explicit gperf version" }
+          }
           
       - name: Build TDLib for Windows (incremental)
         id: build
