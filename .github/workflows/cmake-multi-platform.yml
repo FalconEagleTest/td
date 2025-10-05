@@ -190,49 +190,55 @@ jobs:
           git show --summary
           echo "Building TDLib with streaming readFilePart implementation"
 
-      - name: Cache vcpkg
+      - name: Check vcpkg availability
+        id: check-vcpkg
+        run: |
+          if (Test-Path "C:\vcpkg") {
+            echo "SYSTEM_VCPKG=true" >> $env:GITHUB_OUTPUT
+            Write-Host "✅ System vcpkg detected at C:\vcpkg"
+          } else {
+            echo "SYSTEM_VCPKG=false" >> $env:GITHUB_OUTPUT
+            Write-Host "📦 No system vcpkg - will use local vcpkg"
+          }
+
+      - name: Cache vcpkg (local only)
         uses: actions/cache@v4
         id: cache-vcpkg
-        if: github.event.inputs.force_rebuild_cache != 'true'
+        if: github.event.inputs.force_rebuild_cache != 'true' && steps.check-vcpkg.outputs.SYSTEM_VCPKG == 'false'
         with:
           path: |
             vcpkg
             vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-stable-v1
+          key: ${{ runner.os }}-vcpkg-local-stable-v1
           restore-keys: |
-            ${{ runner.os }}-vcpkg-stable-
-            ${{ runner.os }}-vcpkg-
+            ${{ runner.os }}-vcpkg-local-stable-
+            ${{ runner.os }}-vcpkg-local-
 
       - name: Setup vcpkg (Optimized)
-        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        if: steps.check-vcpkg.outputs.SYSTEM_VCPKG == 'false' && steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: |
-          Write-Host "🚀 Setting up vcpkg with pre-built packages..."
-          
-          # Use vcpkg from Visual Studio installation (faster)
-          if (Test-Path "C:\vcpkg") {
-            Write-Host "✅ Using system vcpkg"
-            echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
-            C:\vcpkg\vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows --triplet x64-windows
-          } else {
-            Write-Host "📦 Cloning fresh vcpkg..."
-            git clone https://github.com/Microsoft/vcpkg.git --depth 1
-            cd vcpkg
-            ./bootstrap-vcpkg.bat
-            echo "VCPKG_ROOT=$PWD" >> $env:GITHUB_ENV
-            ./vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows --triplet x64-windows
-          }
+          Write-Host "🚀 Setting up local vcpkg with pre-built packages..."
+          Write-Host "📦 Cloning fresh vcpkg..."
+          git clone https://github.com/Microsoft/vcpkg.git --depth 1
+          cd vcpkg
+          ./bootstrap-vcpkg.bat
+          echo "VCPKG_ROOT=$PWD" >> $env:GITHUB_ENV
+          ./vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows --triplet x64-windows
 
-      - name: Set vcpkg environment (cached)
-        if: steps.cache-vcpkg.outputs.cache-hit == 'true'
+      - name: Setup system vcpkg
+        if: steps.check-vcpkg.outputs.SYSTEM_VCPKG == 'true'
         run: |
-          Write-Host "📋 Using cached vcpkg..."
-          if (Test-Path "C:\vcpkg") {
-            Write-Host "✅ Using system vcpkg"
-            echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
-          } else {
-            Write-Host "✅ Using cached local vcpkg"
-            echo "VCPKG_ROOT=$PWD\vcpkg" >> $env:GITHUB_ENV
-          }
+          Write-Host "� Using system vcpkg..."
+          Write-Host "✅ Using system vcpkg at C:\vcpkg"
+          echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
+          C:\vcpkg\vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows --triplet x64-windows
+
+      - name: Set vcpkg environment (cached local)
+        if: steps.check-vcpkg.outputs.SYSTEM_VCPKG == 'false' && steps.cache-vcpkg.outputs.cache-hit == 'true'
+        run: |
+          Write-Host "📋 Using cached local vcpkg..."
+          Write-Host "✅ Using cached local vcpkg"
+          echo "VCPKG_ROOT=$PWD\vcpkg" >> $env:GITHUB_ENV
 
       # CMake build cache - saves object files for incremental builds
       # Key strategy: Only invalidate when CMake config changes, not source files
@@ -247,6 +253,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cmake-config-
             ${{ runner.os }}-cmake-
+
+      - name: Ensure build directory exists for cache
+        run: |
+          if (!(Test-Path "build")) { 
+            Write-Host "📁 Creating build directory for cache compatibility"
+            New-Item -Path "build" -ItemType Directory 
+          } else {
+            Write-Host "📁 Build directory already exists"
+          }
 
       - name: Add build info
         run: |
@@ -416,6 +431,44 @@ jobs:
         with:
           name: tdlib-windows-build-logs-failed
           path: build-logs/
+
+      - name: Post-build cleanup and cache preparation
+        if: always()
+        run: |
+          Write-Host "🧹 Preparing cache directories for optimal storage..."
+          
+          # Ensure build directory exists for cache (even if build failed)
+          if (!(Test-Path "build")) { 
+            Write-Host "📁 Creating minimal build directory for cache"
+            New-Item -Path "build" -ItemType Directory 
+            # Create a marker file to indicate build state
+            if ("${{ steps.build.outputs.BUILD_STATUS }}" -eq "failed") {
+              "BUILD_FAILED" | Out-File -FilePath "build/.build_failed" -Encoding UTF8
+            }
+          }
+          
+          # Clean up temporary files that shouldn't be cached
+          if (Test-Path "build") {
+            Write-Host "🗑️ Cleaning temporary build files..."
+            Get-ChildItem "build" -Recurse -Include "*.tmp", "*.temp", "*.log" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          }
+          
+          # Verify cache directories exist
+          $cacheStatus = @()
+          if (Test-Path "build") { 
+            $cacheStatus += "build: ✅" 
+          } else { 
+            $cacheStatus += "build: ❌" 
+          }
+          
+          if (Test-Path "vcpkg" -ErrorAction SilentlyContinue) { 
+            $cacheStatus += "vcpkg: ✅" 
+          } else { 
+            $cacheStatus += "vcpkg: ⚠️ (using system)" 
+          }
+          
+          Write-Host "📋 Cache directories status:"
+          $cacheStatus | ForEach-Object { Write-Host "  $_" }
 
   release:
     needs: [build-android, build-macos-intel, build-ios, build-linux-x64, build-windows-x64]
