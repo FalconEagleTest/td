@@ -214,6 +214,27 @@ jobs:
             ${{ runner.os }}-vcpkg-local-stable-
             ${{ runner.os }}-vcpkg-local-
 
+      - name: Enable vcpkg binary caching
+        run: |
+          echo "VCPKG_FEATURE_FLAGS=manifests,binarycaching" >> $env:GITHUB_ENV
+          echo "VCPKG_OVERLAY_TRIPLETS=" >> $env:GITHUB_ENV
+          # Set a deterministic downloads dir to let cache reuse archives
+          $dl = "$PWD/vcpkg_downloads"
+          if (!(Test-Path $dl)) { New-Item -Path $dl -ItemType Directory | Out-Null }
+          echo "VCPKG_DOWNLOADS=$dl" >> $env:GITHUB_ENV
+
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
+        id: cache-vcpkg-binaries
+        with:
+          path: |
+            C:\Users\runneradmin\AppData\Local\vcpkg\archives
+            C:\Users\runneradmin\AppData\Local\vcpkg\packages
+            vcpkg_downloads
+          key: ${{ runner.os }}-vcpkg-binaries-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-binaries-
+
       - name: Setup vcpkg (Optimized)
         if: steps.check-vcpkg.outputs.SYSTEM_VCPKG == 'false' && steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: |
