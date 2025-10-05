@@ -114,6 +114,42 @@ namespace {
 constexpr int64 MAX_FILE_SIZE = static_cast<int64>(4000) << 20;  // 4000MB
 }  // namespace
 
+void FileManager::download_stream_part(FileId file_id, int8 priority, int64 offset, int32 count, bool no_store,
+                                       Promise<td_api::object_ptr<td_api::data>> promise) {
+  // no_store currently informational; we always avoid persisting
+  if (count <= 0 || count > 64 * 1024) {
+    return promise.set_error(Status::Error(400, PSLICE() << "Invalid count " << count));
+  }
+  if (offset < 0) {
+    return promise.set_error(Status::Error(400, "Offset must be non-negative"));
+  }
+
+  auto file_view = get_file_view(file_id);
+  if (file_view.empty()) {
+    return promise.set_error(Status::Error(400, "Unknown file_id"));
+  }
+  if (!file_view.has_full_remote_location()) {
+    return promise.set_error(Status::Error(400, "File has no remote location"));
+  }
+  const auto *remote = file_view.get_full_remote_location();
+  if (remote == nullptr) {
+    return promise.set_error(Status::Error(400, "Remote location unavailable"));
+  }
+
+  // Launch lightweight actor to fetch bytes via upload.getFile
+  Promise<string> raw_promise = PromiseCreator::lambda([promise = std::move(promise)](Result<string> r) mutable {
+    if (r.is_error()) {
+      return promise.set_error(r.move_as_error());
+    }
+    // Wrap raw bytes into Data (td_api::data) -> expects base64 encoded string in JSON layer
+    auto data_bytes = r.move_as_ok();
+    auto encoded = base64_encode(as_slice(data_bytes));
+    promise.set_value(td_api::make_object<td_api::data>(std::move(encoded)));
+  });
+
+  create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, count, *remote, std::move(raw_promise)).release();
+}
+
 int VERBOSITY_NAME(update_file) = VERBOSITY_NAME(INFO);
 
 StringBuilder &operator<<(StringBuilder &string_builder, FileLocationSource source) {

@@ -5912,12 +5912,23 @@ void Requests::on_request(uint64 id, td_api::finishFileGeneration &request) {
 }
 
 void Requests::on_request(uint64 id, const td_api::readFilePart &request) {
-  // STREAMING VERSION - TDLib 1.8.55-streaming
-  // Modified to use stream_file_part for true streaming without full file download
-  // Saves 99%+ disk space for large video files
   CREATE_DATA_REQUEST_PROMISE();
-  send_closure(td_->file_manager_actor_, &FileManager::stream_file_part, FileId(request.file_id_, 0), request.offset_,
-               request.count_, std::move(promise));
+  send_closure(td_->file_manager_actor_, &FileManager::read_file_part, FileId(request.file_id_, 0), request.offset_,
+               request.count_, 0, std::move(promise));
+}
+
+void Requests::on_request(uint64 id, const td_api::readFileRemotePart &request) {
+  // New streaming API: fetch remote range without persisting
+  CREATE_DATA_REQUEST_PROMISE();
+  // Validate here as a defense-in-depth (primary validation also in FileManager)
+  if (request.count_ <= 0 || request.count_ > 64 * 1024) {
+    return send_error_raw(id, 400, "count must be in 1..65536");
+  }
+  if (request.offset_ < 0) {
+    return send_error_raw(id, 400, "offset must be non-negative");
+  }
+  send_closure(td_->file_manager_actor_, &FileManager::download_stream_part, FileId(request.file_id_, 0), 32,
+               request.offset_, request.count_, request.no_store_, std::move(promise));
 }
 
 void Requests::on_request(uint64 id, const td_api::deleteFile &request) {

@@ -515,6 +515,10 @@ class FileManager final : public Actor {
   bool set_encryption_key(FileId file_id, FileEncryptionKey key);
   bool set_content(FileId file_id, BufferSlice bytes);
 
+  // --- Streaming (no-store) API: fetch arbitrary remote range without persisting ---
+  void download_stream_part(FileId file_id, int8 priority, int64 offset, int32 count, bool no_store,
+                            Promise<td_api::object_ptr<td_api::data>> promise);
+
   void check_local_location(FileId file_id, bool skip_file_size_checks);
   void check_local_location_async(FileId file_id, bool skip_file_size_checks);
 

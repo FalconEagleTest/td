@@ -11980,6 +11980,13 @@ finishFileGeneration generation_id:int64 error:error = Ok;
 //@count Number of bytes to read. An error will be returned if there are not enough bytes available in the file from the specified position. Pass 0 to read all available data from the specified position
 readFilePart file_id:int32 offset:int53 count:int53 = Data;
 
+//@description Streams a remote part of a file directly from the server without storing it on disk; returns raw bytes like Data. Unlike readFilePart, the requested range need not be cached locally and will be fetched from the network if necessary. Intended for low‑storage streaming clients.
+//@file_id Identifier of the file
+//@offset The byte offset from which to read
+//@count Number of bytes to read (1-65536 recommended). Server may return fewer bytes at EOF
+//@no_store Pass true to avoid persisting downloaded bytes to local file cache
+readFileRemotePart file_id:int32 offset:int53 count:int32 no_store:Bool = Data;
+
 //@description Deletes a file from the TDLib file cache @file_id Identifier of the file to delete
 deleteFile file_id:int32 = Ok;
 

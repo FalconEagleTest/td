@@ -785,6 +785,62 @@ class TdClient {
     );
   }
 
+  // --- New zero-disk streaming helper (paired with C++ readFileRemotePart API) ---
+  readFileRemotePart(query) {
+    // Expected fields: file_id, offset, count, no_store (optional), @extra
+    // This mirrors the new TDLib function added in option 2 patch. If core TDLib
+    // doesn't yet support it, we gracefully fall back to legacy behavior.
+    if (!query || typeof query !== 'object') {
+      this.callback({
+        '@type': 'error',
+        '@extra': query && query['@extra'],
+        code: 400,
+        message: 'Invalid readFileRemotePart query'
+      });
+      return;
+    }
+
+    if (!('file_id' in query) || !('offset' in query) || !('count' in query)) {
+      this.callback({
+        '@type': 'error',
+        '@extra': query['@extra'],
+        code: 400,
+        message: 'Missing file_id/offset/count in readFileRemotePart'
+      });
+      return;
+    }
+
+    // Clamp count just in case caller violates the 1..65536 contract
+    if (query.count <= 0) query.count = 1;
+    if (query.count > 65536) query.count = 65536;
+
+    const tdQuery = {
+      '@type': 'readFileRemotePart',
+      file_id: query.file_id,
+      offset: query.offset,
+      count: query.count,
+      no_store: query.no_store !== false, // default true
+      '@extra': query['@extra']
+    };
+
+    // Send directly to TDLib core. If TDLib doesn’t recognize the method, it will
+    // respond with an error. Caller can detect and fall back to readFilePart.
+    try {
+      this.td_functions.td_send(this.client_id, JSON.stringify(tdQuery));
+      this.scheduleReceiveSoon();
+    } catch (e) {
+      // Fallback: use legacy path (will only succeed if data already downloaded)
+      console.warn('readFileRemotePart fallback to readFilePart due to send exception:', e);
+      this.readFilePart({
+        '@type': 'readFilePart',
+        file_id: query.file_id,
+        offset: query.offset,
+        count: query.count,
+        '@extra': query['@extra']
+      });
+    }
+  }
+
   send(query) {
     if (this.isClosing) {
       return;
@@ -824,6 +880,10 @@ class TdClient {
     }
     if (query['@type'] === 'readFilePart') {
       this.readFilePart(query);
+      return;
+    }
+    if (query['@type'] === 'readFileRemotePart') {
+      this.readFileRemotePart(query);
       return;
     }
     if (query['@type'] === 'deleteIdbKey') {

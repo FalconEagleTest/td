@@ -130,6 +130,8 @@ class TdClient {
       this.readFile(query);
       return;
     }
+    // IMPORTANT: do NOT intercept readFileRemotePart here. It must reach the worker so
+    // the worker forwards it directly to TDLib core (new no_store streaming API).
     if (query['@type'] === 'deleteFile') {
       this.deleteFile(query);
       return;
@@ -392,6 +394,52 @@ class TdClient {
   onUpdate(update) {
     log.info('ignore onUpdate');
     //nop
+  }
+
+  /**
+   * Convenience helper for the new zero-disk streaming API (Option 2 patch).
+   * Requires TDLib patched with: readFileRemotePart file_id:int32 offset:int53 count:int32 no_store:Bool = data;
+   * Falls back automatically to legacy readFilePart behavior if the method isn't recognized.
+   * @param {number} file_id
+   * @param {number} offset
+   * @param {number} count  (preferred <= 65536)
+   * @param {Object} [opts]
+   * @param {boolean} [opts.no_store=true]  hint for TDLib not to persist
+   * @returns {Promise<Blob|Uint8Array>} bytes for this window
+   */
+  async streamFileChunk(file_id, offset, count, opts = {}) {
+    try {
+      const resp = await this.send({
+        '@type': 'readFileRemotePart',
+        file_id,
+        offset,
+        count,
+        no_store: opts.no_store !== false
+      });
+      if (resp && resp['@type'] === 'data' && resp.data) {
+        // tdweb usually maps filePart->data:Uint8Array; for new method it may arrive as base64 or raw
+        // If it's a base64 string (browser build choice), decode; otherwise pass through
+        if (typeof resp.data === 'string') {
+          // base64 decode
+          const bin = atob(resp.data);
+            const arr = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+            return arr;
+        }
+        return resp.data; // Already bytes / Uint8Array
+      }
+      return resp;
+    } catch (e) {
+      // Fallback: try legacy readFilePart (will only succeed if already downloaded)
+      log.warn('streamFileChunk fallback to readFilePart:', e);
+      const legacy = await this.send({
+        '@type': 'readFilePart',
+        file_id,
+        offset,
+        count
+      });
+      return legacy.data;
+    }
   }
 }
 
