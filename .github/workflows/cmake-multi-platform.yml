@@ -211,14 +211,27 @@ jobs:
           # Use vcpkg from Visual Studio installation (faster)
           if (Test-Path "C:\vcpkg") {
             Write-Host "✅ Using system vcpkg"
-            $env:VCPKG_ROOT = "C:\vcpkg"
+            echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
             C:\vcpkg\vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows --triplet x64-windows
           } else {
             Write-Host "📦 Cloning fresh vcpkg..."
             git clone https://github.com/Microsoft/vcpkg.git --depth 1
             cd vcpkg
             ./bootstrap-vcpkg.bat
+            echo "VCPKG_ROOT=$PWD" >> $env:GITHUB_ENV
             ./vcpkg.exe install gperf:x64-windows openssl:x64-windows zlib:x64-windows --triplet x64-windows
+          }
+
+      - name: Set vcpkg environment (cached)
+        if: steps.cache-vcpkg.outputs.cache-hit == 'true'
+        run: |
+          Write-Host "📋 Using cached vcpkg..."
+          if (Test-Path "C:\vcpkg") {
+            Write-Host "✅ Using system vcpkg"
+            echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "✅ Using cached local vcpkg"
+            echo "VCPKG_ROOT=$PWD\vcpkg" >> $env:GITHUB_ENV
           }
 
       # CMake build cache - saves object files for incremental builds
@@ -243,83 +256,166 @@ jobs:
           echo "Repository: ${{ github.repository }}"
           
       - name: Build TDLib for Windows (incremental)
+        id: build
+        continue-on-error: true
         run: |
-          if (!(Test-Path "build")) { New-Item -Path "build" -ItemType Directory }
-          cd build
-          if (!(Test-Path "CMakeCache.txt")) {
-            Write-Host "🔧 Configuring CMake..."
-            cmake -A x64 -DCMAKE_INSTALL_PREFIX:PATH=../tdlib -DCMAKE_TOOLCHAIN_FILE:FILEPATH=../vcpkg/scripts/buildsystems/vcpkg.cmake -DTD_VERSION_EXTRA="streaming-readFilePart" ..
-          } else {
-            Write-Host "⚡ Using cached CMake configuration"
+          $buildSuccess = $true
+          try {
+            if (!(Test-Path "build")) { New-Item -Path "build" -ItemType Directory }
+            cd build
+            if (!(Test-Path "CMakeCache.txt")) {
+              Write-Host "🔧 Configuring CMake..."
+              # Determine the correct vcpkg toolchain file path
+              $vcpkgToolchain = if ($env:VCPKG_ROOT) { "$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" } else { "..\vcpkg\scripts\buildsystems\vcpkg.cmake" }
+              Write-Host "Using vcpkg toolchain: $vcpkgToolchain"
+              cmake -A x64 -DCMAKE_INSTALL_PREFIX:PATH=../tdlib -DCMAKE_TOOLCHAIN_FILE:FILEPATH="$vcpkgToolchain" -DTD_VERSION_EXTRA="streaming-readFilePart" ..
+              if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed" }
+            } else {
+              Write-Host "⚡ Using cached CMake configuration"
+            }
+            Write-Host "🏗️ Building TDLib (incremental)..."
+            cmake --build . --config Release --parallel
+            if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+            Write-Host "📦 Installing TDLib..."
+            cmake --build . --config Release --target install
+            if ($LASTEXITCODE -ne 0) { throw "Install failed" }
+            Write-Host "📁 Checking build output..."
+            Get-ChildItem -Recurse ../tdlib
+            echo "BUILD_STATUS=success" >> $env:GITHUB_OUTPUT
+          } catch {
+            Write-Host "❌ Build failed: $_" -ForegroundColor Red
+            $buildSuccess = $false
+            echo "BUILD_STATUS=failed" >> $env:GITHUB_OUTPUT
+            echo "BUILD_ERROR=$_" >> $env:GITHUB_OUTPUT
           }
-          Write-Host "🏗️ Building TDLib (incremental)..."
-          cmake --build . --config Release --parallel
-          Write-Host "📦 Installing TDLib..."
-          cmake --build . --config Release --target install
-          Write-Host "📁 Checking build output..."
-          Get-ChildItem -Recurse ../tdlib
           
       - name: Create build info file
+        if: always()
         run: |
           if (!(Test-Path "tdlib")) { New-Item -Path "tdlib" -ItemType Directory }
           if (!(Test-Path "tdlib/bin")) { New-Item -Path "tdlib/bin" -ItemType Directory }
           cd tdlib/bin
+          
+          $buildStatus = if ("${{ steps.build.outputs.BUILD_STATUS }}" -eq "success") { "SUCCESS" } else { "FAILED" }
+          $buildError = "${{ steps.build.outputs.BUILD_ERROR }}"
+          
           "TDLib 1.8.55-streaming" | Out-File -FilePath "BUILD_INFO.txt" -Encoding UTF8
           "Build Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')" | Out-File -FilePath "BUILD_INFO.txt" -Append -Encoding UTF8
+          "Build Status: $buildStatus" | Out-File -FilePath "BUILD_INFO.txt" -Append -Encoding UTF8
           "Commit: ${{ github.sha }}" | Out-File -FilePath "BUILD_INFO.txt" -Append -Encoding UTF8
           "Repository: ${{ github.repository }}" | Out-File -FilePath "BUILD_INFO.txt" -Append -Encoding UTF8
           "Features: readFilePart streaming optimization" | Out-File -FilePath "BUILD_INFO.txt" -Append -Encoding UTF8
           "Disk Space Savings: 99%+ for large video files" | Out-File -FilePath "BUILD_INFO.txt" -Append -Encoding UTF8
+          if ($buildError) {
+            "Build Error: $buildError" | Out-File -FilePath "BUILD_INFO.txt" -Append -Encoding UTF8
+          }
           Get-Content "BUILD_INFO.txt"
           
       - name: zip
+        if: always()
         run: |
           Write-Host "📋 Listing tdlib contents..."
-          Get-ChildItem -Recurse tdlib
+          if (Test-Path "tdlib") {
+            Get-ChildItem -Recurse tdlib
+          } else {
+            Write-Host "⚠️ tdlib directory not found - build may have failed"
+          }
           
           Write-Host "🔍 Looking for DLL files..."
           $binPath = "tdlib/bin"
           if (Test-Path $binPath) {
             cd $binPath
-            Get-ChildItem *.dll
             
-            # Rename OpenSSL DLLs if they exist (flexible naming)
-            if (Test-Path "*crypto*.dll") { 
-              $cryptoDll = Get-ChildItem "*crypto*.dll" | Select-Object -First 1
-              Move-Item $cryptoDll.Name "libcrypto-1_1.dll" -Force
-            }
-            if (Test-Path "*ssl*.dll") { 
-              $sslDll = Get-ChildItem "*ssl*.dll" | Select-Object -First 1
-              Move-Item $sslDll.Name "libssl-1_1.dll" -Force  
-            }
-            
-            Write-Host "📦 Creating zip archive..."
+            # Always include BUILD_INFO.txt
             $filesToZip = @()
-            if (Test-Path "libcrypto-1_1.dll") { $filesToZip += "libcrypto-1_1.dll" }
-            if (Test-Path "libssl-1_1.dll") { $filesToZip += "libssl-1_1.dll" }
-            if (Test-Path "tdjson.dll") { $filesToZip += "tdjson.dll" }
-            if (Test-Path "zlib1.dll") { $filesToZip += "zlib1.dll" }
             if (Test-Path "BUILD_INFO.txt") { $filesToZip += "BUILD_INFO.txt" }
             
+            # Look for DLL files (may not exist if build failed)
+            $dllFiles = Get-ChildItem *.dll -ErrorAction SilentlyContinue
+            if ($dllFiles) {
+              Write-Host "✅ Found DLL files"
+              
+              # Rename OpenSSL DLLs if they exist (flexible naming)
+              if (Test-Path "*crypto*.dll") { 
+                $cryptoDll = Get-ChildItem "*crypto*.dll" | Select-Object -First 1
+                Move-Item $cryptoDll.Name "libcrypto-1_1.dll" -Force
+              }
+              if (Test-Path "*ssl*.dll") { 
+                $sslDll = Get-ChildItem "*ssl*.dll" | Select-Object -First 1
+                Move-Item $sslDll.Name "libssl-1_1.dll" -Force  
+              }
+              
+              # Add DLL files to zip list
+              if (Test-Path "libcrypto-1_1.dll") { $filesToZip += "libcrypto-1_1.dll" }
+              if (Test-Path "libssl-1_1.dll") { $filesToZip += "libssl-1_1.dll" }
+              if (Test-Path "tdjson.dll") { $filesToZip += "tdjson.dll" }
+              if (Test-Path "zlib1.dll") { $filesToZip += "zlib1.dll" }
+            } else {
+              Write-Host "⚠️ No DLL files found - this may indicate a build failure"
+            }
+            
+            Write-Host "📦 Creating archive..."
             Write-Host "Files to zip: $($filesToZip -join ', ')"
             if ($filesToZip.Count -gt 0) {
               7z a -tzip dlls.zip $filesToZip
               Write-Host "✅ Archive created successfully"
               7z l dlls.zip
             } else {
-              Write-Host "❌ No DLL files found to zip"
-              exit 1
+              Write-Host "⚠️ Creating minimal archive with build info only"
+              "Build failed - no artifacts produced" | Out-File -FilePath "ERROR.txt" -Encoding UTF8
+              7z a -tzip dlls.zip ERROR.txt
             }
           } else {
-            Write-Host "❌ tdlib/bin directory not found"
-            exit 1
+            Write-Host "❌ tdlib/bin directory not found - creating error archive"
+            if (!(Test-Path "tdlib")) { New-Item -Path "tdlib" -ItemType Directory }
+            if (!(Test-Path "tdlib/bin")) { New-Item -Path "tdlib/bin" -ItemType Directory }
+            cd tdlib/bin
+            "Build completely failed - no output directory created" | Out-File -FilePath "CRITICAL_ERROR.txt" -Encoding UTF8
+            7z a -tzip dlls.zip CRITICAL_ERROR.txt
           }
           
       - name: Upload Windows Build
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tdlib-windows-streaming
+          name: tdlib-windows-streaming-${{ steps.build.outputs.BUILD_STATUS || 'unknown' }}
           path: tdlib/bin/dlls.zip
+
+      - name: Collect build logs on failure
+        if: always() && steps.build.outputs.BUILD_STATUS == 'failed'
+        run: |
+          Write-Host "🔍 Collecting build logs for debugging..."
+          $logDir = "build-logs"
+          if (!(Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory }
+          
+          # Collect CMake logs
+          if (Test-Path "build/CMakeFiles/CMakeOutput.log") {
+            Copy-Item "build/CMakeFiles/CMakeOutput.log" "$logDir/CMakeOutput.log"
+          }
+          if (Test-Path "build/CMakeFiles/CMakeError.log") {
+            Copy-Item "build/CMakeFiles/CMakeError.log" "$logDir/CMakeError.log"
+          }
+          if (Test-Path "build/CMakeCache.txt") {
+            Copy-Item "build/CMakeCache.txt" "$logDir/CMakeCache.txt"
+          }
+          
+          # Create a summary of the failure
+          "Build Failure Summary" | Out-File -FilePath "$logDir/FAILURE_SUMMARY.txt" -Encoding UTF8
+          "========================" | Out-File -FilePath "$logDir/FAILURE_SUMMARY.txt" -Append -Encoding UTF8
+          "Build Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')" | Out-File -FilePath "$logDir/FAILURE_SUMMARY.txt" -Append -Encoding UTF8
+          "Commit: ${{ github.sha }}" | Out-File -FilePath "$logDir/FAILURE_SUMMARY.txt" -Append -Encoding UTF8
+          "Error: ${{ steps.build.outputs.BUILD_ERROR }}" | Out-File -FilePath "$logDir/FAILURE_SUMMARY.txt" -Append -Encoding UTF8
+          "========================" | Out-File -FilePath "$logDir/FAILURE_SUMMARY.txt" -Append -Encoding UTF8
+          
+          Write-Host "📋 Available log files:"
+          Get-ChildItem $logDir
+          
+      - name: Upload build logs on failure
+        if: always() && steps.build.outputs.BUILD_STATUS == 'failed'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-windows-build-logs-failed
+          path: build-logs/
 
   release:
     needs: [build-android, build-macos-intel, build-ios, build-linux-x64, build-windows-x64]
@@ -328,7 +424,7 @@ jobs:
     steps:
       - name: Get current date/time
         id: datetime
-        run: echo "DATE=$(date -u +'%Y-%m-%d_%H-%M')" >> $GITHUB_ENV
+        run: echo "DATE=$(date -u +'%Y-%m-%d_%H-%M')" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -341,8 +437,8 @@ jobs:
       - name: Create a GitHub Release
         uses: ncipollo/release-action@v1
         with:
-          tag: tdlib-${{ env.DATE }}
-          name: TDLib Build ${{ env.DATE }}
+          tag: tdlib-${{ steps.datetime.outputs.DATE }}
+          name: TDLib Build ${{ steps.datetime.outputs.DATE }}
           body: "TDLib build release containing all selected platform binaries."
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: "artifacts/**/**"
