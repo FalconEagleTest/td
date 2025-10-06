@@ -116,6 +116,8 @@ constexpr int64 MAX_FILE_SIZE = static_cast<int64>(4000) << 20;  // 4000MB
 
 void FileManager::download_stream_part(FileId file_id, int8 priority, int64 offset, int32 count, bool no_store,
                                        Promise<td_api::object_ptr<td_api::data>> promise) {
+  (void)priority; // not used in direct streaming path
+  (void)no_store; // informational only for now
   // no_store currently informational; we always avoid persisting
   if (count <= 0 || count > 64 * 1024) {
     return promise.set_error(Status::Error(400, PSLICE() << "Invalid count " << count));
