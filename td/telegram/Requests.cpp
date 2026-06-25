@@ -5918,23 +5918,14 @@ void Requests::on_request(uint64 id, const td_api::readFilePart &request) {
 }
 
 void Requests::on_request(uint64 id, const td_api::readFileRemotePart &request) {
-  // Explicit (macro-free) implementation to avoid Promise<string> -> Promise<data> mismatch
-  if (request.count_ <= 0 || request.count_ > 64 * 1024) {
-    return send_error_raw(id, 400, "count must be in 1..65536");
-  }
-  if (request.offset_ < 0) {
-    return send_error_raw(id, 400, "offset must be non-negative");
-  }
-
-  // Promise returns td_api::data object directly (FileManager already base64-encodes and constructs object)
-  auto data_promise = PromiseCreator::lambda([actor_id = td_actor_, id](
-                                                 Result<td_api::object_ptr<td_api::data>> r) mutable {
-    if (r.is_error()) {
-      send_closure(actor_id, &Td::send_error, id, r.move_as_error());
-    } else {
-      send_closure(actor_id, &Td::send_result, id, r.move_as_ok());
-    }
-  });
+  auto data_promise = PromiseCreator::lambda(
+      [actor_id = td_actor_, id](Result<td_api::object_ptr<td_api::data>> r) mutable {
+        if (r.is_error()) {
+          send_closure(actor_id, &Td::send_error, id, r.move_as_error());
+        } else {
+          send_closure(actor_id, &Td::send_result, id, r.move_as_ok());
+        }
+      });
 
   send_closure(td_->file_manager_actor_, &FileManager::download_stream_part, FileId(request.file_id_, 0),
                static_cast<int8>(32), static_cast<int64>(request.offset_), static_cast<int32>(request.count_),

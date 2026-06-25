@@ -393,8 +393,6 @@ class FileView {
   ConstFileNodePtr node_{};
 };
 
-class StreamGetFileActor; // forward declaration for streaming helper
-
 class FileManager final : public Actor {
  public:
   class DownloadCallback {
@@ -519,6 +517,11 @@ class FileManager final : public Actor {
   void download_stream_part(FileId file_id, int8 priority, int64 offset, int32 count, bool no_store,
                             Promise<td_api::object_ptr<td_api::data>> promise);
 
+  // Internal helpers used by StreamGetFileActor to recover from FILE_REFERENCE_EXPIRED.
+  void repair_stream_file_reference(FileId file_id, string bad_reference,
+                                    Promise<FullRemoteFileLocation> promise);
+  void on_stream_file_reference_repaired(FileId file_id, Promise<FullRemoteFileLocation> promise);
+
   void check_local_location(FileId file_id, bool skip_file_size_checks);
   void check_local_location_async(FileId file_id, bool skip_file_size_checks);
 
@@ -557,10 +560,6 @@ class FileManager final : public Actor {
   Result<string> get_suggested_file_name(FileId file_id, const string &directory);
 
   void read_file_part(FileId file_id, int64 offset, int64 count, int left_tries, Promise<string> promise);
-
-  // STREAMING VERSION - TDLib 1.8.55-streaming
-  // Stream file part without requiring full download - saves 99%+ disk space
-  void stream_file_part(FileId file_id, int64 offset, int64 count, Promise<string> promise);
 
   void delete_file(FileId file_id, Promise<Unit> promise, const char *source);
 
@@ -618,8 +617,6 @@ class FileManager final : public Actor {
 
   template <class ParserT>
   FileId parse_file(ParserT &parser);
-  // Keep temporary streaming actors alive until completion (one-shot upload.getFile requests)
-  std::vector<ActorOwn<StreamGetFileActor>> streaming_stream_actors_;
 
  private:
   static constexpr bool STORE_FILE_INFO = false;

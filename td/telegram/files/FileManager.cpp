@@ -1,6 +1,4 @@
 #include "td/telegram/telegram_api.h"
-// ActorOwn is defined in td/actor/impl/ActorId-decl.h, so include it for clarity
-#include "td/actor/impl/ActorId-decl.h"
 //
 // Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
@@ -22,43 +20,49 @@
 #include "td/telegram/net/NetQuery.h"
 #include "td/actor/actor.h"
 
-// StreamGetFileActor definition placed after required includes; only inherit NetQueryCallback (already an Actor)
 namespace td {
+// One-shot actor that runs a single MTProto upload.getFile to fetch a remote byte range,
+// with automatic file_reference refresh on FILE_REFERENCE_EXPIRED. The actor stops itself
+// after fulfilling its promise.
 class StreamGetFileActor final : public NetQueryCallback {
  public:
   StreamGetFileActor(FileId file_id, int64 offset, int32 length, FullRemoteFileLocation remote,
-                     Promise<string> promise)
-      : file_id_(file_id), offset_(offset), length_(length), remote_(std::move(remote)), promise_(std::move(promise)) {
+                     ActorId<FileManager> file_manager, Promise<string> promise)
+      : file_id_(file_id),
+        offset_(offset),
+        length_(length),
+        remote_(std::move(remote)),
+        file_manager_(std::move(file_manager)),
+        promise_(std::move(promise)) {
   }
 
   void start_up() override {
-    auto input_location = remote_.as_input_file_location();
-    if (!input_location) {
-      promise_.set_error(Status::Error(400, "Can't create input location"));
-      stop();
-      return;
-    }
-    auto query = telegram_api::upload_getFile(0, false, false, std::move(input_location), offset_, length_);
-    auto net_query = G()->net_query_creator().create(query, {}, remote_.get_dc_id());
-    G()->net_query_dispatcher().dispatch_with_callback(std::move(net_query), actor_shared(this));
+    dispatch_query();
   }
 
   void on_result(NetQueryPtr net_query) override {
     if (net_query->is_error()) {
-      auto error = net_query->move_as_error();
-      LOG(ERROR) << "STREAMING: upload.getFile failed - file_id=" << file_id_.get() 
-                 << " offset=" << offset_ << " length=" << length_ 
-                 << " error=" << error.code() << " message=" << error.message();
-      promise_.set_error(std::move(error));
-      stop();
-      return;
+      return handle_error(net_query->move_as_error());
     }
-    TRY_RESULT_PROMISE(promise_, file_base, fetch_result<telegram_api::upload_getFile>(net_query->ok()));
-    auto *upload_file = static_cast<telegram_api::upload_file *>(file_base.get());
-    LOG(INFO) << "STREAMING: upload.getFile success - file_id=" << file_id_.get() 
-              << " offset=" << offset_ << " length=" << length_ 
-              << " received_bytes=" << upload_file->bytes_.size();
-    promise_.set_value(upload_file->bytes_.as_slice().str());
+
+    // Guard against upload.fileCdnRedirect — proper CDN streaming would need a separate flow.
+    if (net_query->ok_tl_constructor() == telegram_api::upload_fileCdnRedirect::ID) {
+      promise_.set_error(Status::Error(500, "CDN file streaming is not supported"));
+      return stop();
+    }
+
+    auto r_file_base = fetch_result<telegram_api::upload_getFile>(net_query->ok());
+    if (r_file_base.is_error()) {
+      promise_.set_error(r_file_base.move_as_error());
+      return stop();
+    }
+    auto file_base = r_file_base.move_as_ok();
+    if (file_base->get_id() != telegram_api::upload_file::ID) {
+      promise_.set_error(Status::Error(500, "Unexpected upload.getFile response"));
+      return stop();
+    }
+    auto file = move_tl_object_as<telegram_api::upload_file>(file_base);
+    promise_.set_value(file->bytes_.as_slice().str());
     stop();
   }
 
@@ -74,9 +78,47 @@ class StreamGetFileActor final : public NetQueryCallback {
   int64 offset_;
   int32 length_;
   FullRemoteFileLocation remote_;
+  ActorId<FileManager> file_manager_;
   Promise<string> promise_;
+  int retries_left_ = 3;
+
+  void dispatch_query() {
+    auto input_location = remote_.as_input_file_location();
+    if (!input_location) {
+      promise_.set_error(Status::Error(400, "Can't create input file location"));
+      return stop();
+    }
+    auto query = telegram_api::upload_getFile(0, false, false, std::move(input_location), offset_, length_);
+    auto net_query = G()->net_query_creator().create(query, {}, remote_.get_dc_id());
+    G()->net_query_dispatcher().dispatch_with_callback(std::move(net_query), actor_shared(this));
+  }
+
+  void handle_error(Status error) {
+    if (retries_left_ > 0 && FileReferenceManager::is_file_reference_error(error)) {
+      retries_left_--;
+      string bad_reference = remote_.get_file_reference().str();
+      send_closure(file_manager_, &FileManager::repair_stream_file_reference, file_id_, std::move(bad_reference),
+                   PromiseCreator::lambda([actor_id = actor_id(this)](Result<FullRemoteFileLocation> r) {
+                     send_closure(actor_id, &StreamGetFileActor::on_reference_repaired, std::move(r));
+                   }));
+      return;
+    }
+    LOG(INFO) << "STREAMING: upload.getFile failed file_id=" << file_id_.get() << " offset=" << offset_
+              << " length=" << length_ << " error=" << error;
+    promise_.set_error(std::move(error));
+    stop();
+  }
+
+  void on_reference_repaired(Result<FullRemoteFileLocation> r_remote) {
+    if (r_remote.is_error()) {
+      promise_.set_error(r_remote.move_as_error());
+      return stop();
+    }
+    remote_ = r_remote.move_as_ok();
+    dispatch_query();
+  }
 };
-} // namespace td
+}  // namespace td
 #include "td/telegram/logevent/LogEvent.h"
 #include "td/telegram/misc.h"
 #include "td/telegram/SecureStorage.h"
@@ -116,14 +158,28 @@ constexpr int64 MAX_FILE_SIZE = static_cast<int64>(4000) << 20;  // 4000MB
 
 void FileManager::download_stream_part(FileId file_id, int8 priority, int64 offset, int32 count, bool no_store,
                                        Promise<td_api::object_ptr<td_api::data>> promise) {
-  (void)priority; // not used in direct streaming path
-  (void)no_store; // informational only for now
-  // no_store currently informational; we always avoid persisting
-  if (count <= 0 || count > 64 * 1024) {
-    return promise.set_error(Status::Error(400, PSLICE() << "Invalid count " << count));
-  }
+  TRY_STATUS_PROMISE(promise, G()->close_status());
+  (void)priority;  // direct streaming path doesn't queue, so priority is informational
+  (void)no_store;  // streaming never persists; flag is reserved for future cache integration
+
+  constexpr int32 MAX_COUNT = 1024 * 1024;  // MTProto upload.getFile hard limit
   if (offset < 0) {
     return promise.set_error(Status::Error(400, "Offset must be non-negative"));
+  }
+  if (count <= 0 || count > MAX_COUNT) {
+    return promise.set_error(Status::Error(400, PSLICE() << "count must be in 1.." << MAX_COUNT));
+  }
+  // MTProto upload.getFile requires offset%4096==0, count%4096==0, 1MB%count==0,
+  // and the range must lie within a single 1 MiB block.
+  constexpr int32 ALIGN = 4096;
+  if (offset % ALIGN != 0) {
+    return promise.set_error(Status::Error(400, "offset must be a multiple of 4096"));
+  }
+  if (count % ALIGN != 0 || MAX_COUNT % count != 0) {
+    return promise.set_error(Status::Error(400, "count must be a power-of-two multiple of 4096 up to 1048576"));
+  }
+  if (offset / MAX_COUNT != (offset + count - 1) / MAX_COUNT) {
+    return promise.set_error(Status::Error(400, "Range must not cross a 1 MiB boundary"));
   }
 
   auto file_view = get_file_view(file_id);
@@ -138,18 +194,48 @@ void FileManager::download_stream_part(FileId file_id, int8 priority, int64 offs
     return promise.set_error(Status::Error(400, "Remote location unavailable"));
   }
 
-  // Launch lightweight actor to fetch bytes via upload.getFile
   Promise<string> raw_promise = PromiseCreator::lambda([promise = std::move(promise)](Result<string> r) mutable {
     if (r.is_error()) {
       return promise.set_error(r.move_as_error());
     }
-    // Wrap raw bytes into Data (td_api::data) -> expects base64 encoded string in JSON layer
-    auto data_bytes = r.move_as_ok();
-    auto encoded = base64_encode(as_slice(data_bytes));
-    promise.set_value(td_api::make_object<td_api::data>(std::move(encoded)));
+    // The td_api::data.data field is a `bytes` type; the JSON serializer
+    // base64-encodes it automatically. Passing pre-encoded bytes here
+    // would double-encode — the client would see the base64 string of
+    // a base64 string instead of the original bytes.
+    promise.set_value(td_api::make_object<td_api::data>(r.move_as_ok()));
   });
 
-  create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, count, *remote, std::move(raw_promise)).release();
+  create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, count, *remote, actor_id(this),
+                                   std::move(raw_promise))
+      .release();
+}
+
+void FileManager::repair_stream_file_reference(FileId file_id, string bad_reference,
+                                               Promise<FullRemoteFileLocation> promise) {
+  TRY_STATUS_PROMISE(promise, G()->close_status());
+  auto node = get_sync_file_node(file_id);
+  if (!node) {
+    return promise.set_error(Status::Error(400, "File not found"));
+  }
+  if (!bad_reference.empty()) {
+    delete_file_reference(file_id, bad_reference);
+  }
+  context_->repair_file_reference(
+      file_id, PromiseCreator::lambda([actor_id = actor_id(this), file_id,
+                                       promise = std::move(promise)](Result<Unit> r) mutable {
+        if (r.is_error()) {
+          return promise.set_error(r.move_as_error());
+        }
+        send_closure(actor_id, &FileManager::on_stream_file_reference_repaired, file_id, std::move(promise));
+      }));
+}
+
+void FileManager::on_stream_file_reference_repaired(FileId file_id, Promise<FullRemoteFileLocation> promise) {
+  auto file_view = get_file_view(file_id);
+  if (file_view.empty() || !file_view.has_full_remote_location()) {
+    return promise.set_error(Status::Error(400, "Remote location lost after repair"));
+  }
+  promise.set_value(FullRemoteFileLocation(*file_view.get_full_remote_location()));
 }
 
 int VERBOSITY_NAME(update_file) = VERBOSITY_NAME(INFO);
@@ -3031,68 +3117,6 @@ void FileManager::read_file_part(FileId file_id, int64 offset, int64 count, int 
       });
   send_closure(file_load_manager_, &FileLoadManager::read_file_part, *path, offset, count,
                std::move(read_file_part_promise));
-}
-
-void FileManager::stream_file_part(FileId file_id, int64 offset, int64 count, Promise<string> promise) {
-  TRY_STATUS_PROMISE(promise, G()->close_status());
-
-  if (!file_id.is_valid()) {
-    return promise.set_error(Status::Error(400, "File identifier is invalid"));
-  }
-  auto node = get_sync_file_node(file_id);
-  if (!node) {
-    return promise.set_error(Status::Error(400, "File not found"));
-  }
-  if (offset < 0) {
-    return promise.set_error(Status::Error(400, "Parameter offset must be non-negative"));
-  }
-  if (count <= 0) {
-    return promise.set_error(Status::Error(400, "Parameter count must be positive"));
-  }
-  if (count > std::numeric_limits<int32>::max()) {
-    return promise.set_error(Status::Error(400, "Parameter count must not exceed 2147483647 bytes (Telegram API limit)"));
-  }
-  if (count >= static_cast<int64>(std::numeric_limits<size_t>::max() / 2 - 1)) {
-    return promise.set_error(Status::Error(400, "Part length is too big"));
-  }
-
-  auto file_view = FileView(node);
-  if (!file_view.has_full_remote_location()) {
-    return promise.set_error(Status::Error(400, "File has no remote location"));
-  }
-  const auto *remote_location = file_view.get_full_remote_location();
-  if (!remote_location) {
-    return promise.set_error(Status::Error(400, "Invalid remote location"));
-  }
-  auto input_location = remote_location->as_input_file_location();
-  if (!input_location) {
-    return promise.set_error(Status::Error(400, "Invalid input file location"));
-  }
-
-  LOG(INFO) << "STREAMING: Direct upload.getFile call - file_id=" << file_id.get() << " offset=" << offset << " count=" << count
-            << " remote_dc=" << remote_location->get_dc_id() << " file_type=" << static_cast<int>(file_view.get_type());
-
-  // FIXED: Use safe chunk size that works reliably with Telegram API  
-  // Common working values: 64KB, 128KB, 256KB, 512KB
-  constexpr int64 SAFE_CHUNK_SIZE = 512 * 1024;  // 512KB - matches TDLib's MAX_PART_SIZE
-  
-  // Align count to safe boundaries and don't exceed chunk size
-  int64 safe_count = std::min(count, SAFE_CHUNK_SIZE);
-  
-  // Additional validation for common Telegram API constraints
-  if (offset % 1024 != 0) {
-    LOG(WARNING) << "STREAMING: Offset " << offset << " is not aligned to 1KB boundary";
-  }
-  if (safe_count % 1024 != 0) {
-    LOG(WARNING) << "STREAMING: Count " << safe_count << " is not aligned to 1KB boundary";  
-  }
-  if (safe_count > 1048576) { // 1MB
-    LOG(WARNING) << "STREAMING: Count " << safe_count << " exceeds 1MB, may cause server issues";
-  }
-
-  auto actor = create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, narrow_cast<int32>(safe_count),
-                                                *remote_location, std::move(promise));
-  streaming_stream_actors_.push_back(std::move(actor));
 }
 
 void FileManager::delete_file(FileId file_id, Promise<Unit> promise, const char *source) {
