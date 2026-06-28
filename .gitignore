@@ -6,3 +6,19 @@ docs/
 /tdlib/
 vcpkg/
 .clang-tidy
+
+# --- Local-only artifacts not for upstream ---
+# Python streaming test session (contains Telegram auth tokens!)
+python_test/session/
+python_test/downloads/
+python_test/__pycache__/
+python_test/**/*.pyc
+
+# Android SDK / NDK and OpenSSL builds (re-downloadable, huge)
+example/android/SDK/
+example/android/third-party/
+example/android/tdlib/
+example/android/_android_build.log
+example/android/build-x86_64-JSON/
+example/android/build-x86-JSON/
+
