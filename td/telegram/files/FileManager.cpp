@@ -22,6 +22,8 @@
 #include "td/utils/as.h"
 #include "td/utils/crypto.h"
 
+#include <map>
+
 namespace td {
 // One-shot actor that fetches a remote byte range via the patched
 // readFileRemotePart streaming path. Supports:
@@ -61,6 +63,8 @@ class StreamGetFileActor final : public NetQueryCallback {
         return on_cdn_result(ctor, std::move(net_query));
       case Phase::Reupload:
         return on_reupload_result(std::move(net_query));
+      case Phase::GetHashes:
+        return on_get_hashes_result(std::move(net_query));
     }
   }
 
@@ -72,7 +76,13 @@ class StreamGetFileActor final : public NetQueryCallback {
   }
 
  private:
-  enum class Phase { Direct, Cdn, Reupload };
+  enum class Phase { Direct, Cdn, Reupload, GetHashes };
+
+  struct CdnHash {
+    int64 offset;
+    int32 limit;
+    string hash;  // 32 bytes (SHA-256)
+  };
 
   FileId file_id_;
   int64 offset_;
@@ -89,6 +99,9 @@ class StreamGetFileActor final : public NetQueryCallback {
   string cdn_encryption_key_;  // 32 bytes
   string cdn_encryption_iv_;   // 16 bytes
   string cdn_reupload_token_;  // non-empty triggers a Reupload phase
+  std::map<int64, CdnHash> cdn_hashes_;  // by offset; populated by redirect / reupload / getCdnFileHashes
+  string pending_decrypted_;  // decrypted CDN bytes awaiting hash verification
+  bool hashes_refetched_ = false;  // guard against infinite hash-refetch loops
 
   void dispatch_query() {
     NetQueryPtr net_query;
@@ -135,6 +148,7 @@ class StreamGetFileActor final : public NetQueryCallback {
         promise_.set_error(Status::Error(500, "Invalid CDN key or IV size"));
         return stop();
       }
+      store_cdn_hashes(redirect->file_hashes_);
       have_cdn_ = true;
       return dispatch_query();
     }
@@ -191,19 +205,104 @@ class StreamGetFileActor final : public NetQueryCallback {
     ctr_state.init(cdn_encryption_key_, iv);
     ctr_state.decrypt(bytes.as_slice(), bytes.as_mutable_slice());
 
-    promise_.set_value(bytes.as_slice().str());
-    stop();
+    pending_decrypted_ = bytes.as_slice().str();
+    return finalize_with_hash_check();
+  }
+
+  // SECURITY: CDN bytes MUST be verified against file_hashes before
+  // being returned to the caller. A malicious CDN could otherwise serve
+  // tampered content. We never set the promise to "value" without
+  // first proving the SHA-256 of each covered range matches the hash
+  // Telegram signed in upload.fileCdnRedirect (or in subsequent
+  // upload.getCdnFileHashes responses).
+  void finalize_with_hash_check() {
+    auto v = verify_cdn_bytes(pending_decrypted_);
+    if (v == VerifyResult::Ok) {
+      promise_.set_value(std::move(pending_decrypted_));
+      return stop();
+    }
+    if (v == VerifyResult::HashMismatch) {
+      promise_.set_error(Status::Error(500, "CDN hash verification failed"));
+      return stop();
+    }
+    // VerifyResult::NeedMoreHashes -- fetch them once; refuse infinite loops.
+    if (hashes_refetched_) {
+      promise_.set_error(Status::Error(500, "CDN hashes still incomplete after refetch"));
+      return stop();
+    }
+    hashes_refetched_ = true;
+    last_phase_ = Phase::GetHashes;
+    auto net_query = G()->net_query_creator().create_unauth(
+        telegram_api::upload_getCdnFileHashes(BufferSlice(cdn_file_token_), offset_),
+        cdn_dc_id_);
+    G()->net_query_dispatcher().dispatch_with_callback(std::move(net_query), actor_shared(this));
+  }
+
+  void on_get_hashes_result(NetQueryPtr net_query) {
+    auto r = fetch_result<telegram_api::upload_getCdnFileHashes>(net_query->ok());
+    if (r.is_error()) {
+      promise_.set_error(r.move_as_error());
+      return stop();
+    }
+    store_cdn_hashes(r.ok());
+    return finalize_with_hash_check();
   }
 
   void on_reupload_result(NetQueryPtr net_query) {
-    // upload.reuploadCdnFile returns Vector<FileHash>. We don't verify
-    // hashes in this first cut — just retry the CDN fetch on success.
+    // upload.reuploadCdnFile returns Vector<FileHash>. Add them to our
+    // hash set so subsequent verification has more coverage.
     auto r = fetch_result<telegram_api::upload_reuploadCdnFile>(net_query->ok());
     if (r.is_error()) {
       promise_.set_error(r.move_as_error());
       return stop();
     }
+    store_cdn_hashes(r.ok());
     return dispatch_query();
+  }
+
+  // --- hash storage + verification helpers ---
+
+  void store_cdn_hashes(
+      const std::vector<telegram_api::object_ptr<telegram_api::fileHash>> &hashes) {
+    for (const auto &h : hashes) {
+      if (!h) continue;
+      CdnHash entry{h->offset_, h->limit_, h->hash_.as_slice().str()};
+      cdn_hashes_[entry.offset] = std::move(entry);
+    }
+  }
+
+  enum class VerifyResult { Ok, NeedMoreHashes, HashMismatch };
+
+  // Walk hashes covering [offset_, offset_+bytes.size()). Every byte
+  // MUST be inside a hash range whose SHA-256 matches. Any gap or
+  // overrun → NeedMoreHashes. Any signature mismatch → HashMismatch.
+  VerifyResult verify_cdn_bytes(const string &bytes) const {
+    int64 cursor = offset_;
+    int64 end = offset_ + static_cast<int64>(bytes.size());
+    auto it = cdn_hashes_.lower_bound(cursor);
+    while (cursor < end) {
+      if (it == cdn_hashes_.end() || it->second.offset != cursor) {
+        return VerifyResult::NeedMoreHashes;
+      }
+      const auto &h = it->second;
+      if (h.limit <= 0 || h.hash.size() != 32) {
+        return VerifyResult::HashMismatch;
+      }
+      int64 hash_end = h.offset + h.limit;
+      if (hash_end > end) {
+        return VerifyResult::NeedMoreHashes;
+      }
+      size_t local_off = static_cast<size_t>(h.offset - offset_);
+      string actual(32, '\0');
+      sha256(Slice(bytes.data() + local_off, static_cast<size_t>(h.limit)),
+             MutableSlice(&actual[0], actual.size()));
+      if (actual != h.hash) {
+        return VerifyResult::HashMismatch;
+      }
+      cursor = hash_end;
+      ++it;
+    }
+    return VerifyResult::Ok;
   }
 
   void handle_error(Status error) {
