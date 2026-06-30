@@ -151,10 +151,14 @@ jobs:
           echo "=== Bundled DLLs ==="
           ls -lh artifacts/windows/
 
+          # Zip everything for clean download
+          cd artifacts/windows
+          zip ../libtdjson-windows.zip ./*.dll
+
       - uses: actions/upload-artifact@v4
         with:
           name: libtdjson-windows
-          path: artifacts/windows/
+          path: artifacts/libtdjson-windows.zip
           retention-days: 30
 
 # ─────────────────────────────────────────────────────────────
@@ -248,7 +252,7 @@ jobs:
         run: |
           ./build-tdlib.sh SDK "" "" "" "JSON"
 
-      - name: Collect .so artifacts
+      - name: Collect .so artifacts + zip
         run: |
           mkdir -p artifacts/android
           cp example/android/tdlib/libs/arm64-v8a/libtdjson.so \
@@ -256,11 +260,13 @@ jobs:
           cp example/android/tdlib/libs/armeabi-v7a/libtdjson.so \
              artifacts/android/libtdjsonjava32.so
           ls -lh artifacts/android/
+          cd artifacts/android
+          zip ../libtdjson-android.zip ./*.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: libtdjson-android
-          path: artifacts/android/
+          path: artifacts/libtdjson-android.zip
           retention-days: 30
 
 # ─────────────────────────────────────────────────────────────
