@@ -18,8 +18,12 @@ on:
         description: 'Build Android arm64-v8a + armeabi-v7a .so'
         type: boolean
         default: true
+      create_release:
+        description: 'Create a GitHub Release with the built artifacts'
+        type: boolean
+        default: true
       release_tag:
-        description: 'Release tag (e.g. v1.8.65-1). Leave empty to skip release.'
+        description: 'Release tag override. Leave empty to auto-generate from TDLib version + date (e.g. v1.8.65-20260630)'
         type: string
         default: ''
 
@@ -254,13 +258,29 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-22.04
     needs: [build-windows, build-android]
-    # Only run if a tag was supplied and at least one build succeeded.
     if: |
       always() &&
       github.event_name == 'workflow_dispatch' &&
-      inputs.release_tag != '' &&
+      inputs.create_release &&
       (needs.build-windows.result == 'success' || needs.build-android.result == 'success')
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production
+
+      # Auto-generate tag from TDLib version + today's date if not overridden.
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            echo "tag=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            VERSION=$(grep -m1 'project(TDLib VERSION' CMakeLists.txt | grep -oP '[\d.]+')
+            DATE=$(date +%Y%m%d)
+            echo "tag=v${VERSION}-${DATE}" >> $GITHUB_OUTPUT
+          fi
+          echo "Resolved tag: $(cat $GITHUB_OUTPUT | grep tag= | cut -d= -f2)"
+
       - name: Download Windows artifact
         if: needs.build-windows.result == 'success'
         uses: actions/download-artifact@v4
@@ -278,8 +298,8 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag }}
-          name: "TDLib ${{ inputs.release_tag }}"
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "TDLib ${{ steps.tag.outputs.tag }}"
           body: |
             TDLib 1.8.65 fork build — readFileRemotePart streaming + file_hashes CDN verification.
 
