@@ -89,7 +89,7 @@ jobs:
           ref: production
 
       - name: Install MSYS2 + MinGW64 toolchain
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@v2.32.0
         with:
           msystem: MINGW64
           update: true
