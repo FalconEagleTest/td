@@ -155,6 +155,13 @@ jobs:
           cd artifacts/windows
           zip ../libtdjson-windows.zip ./*.dll
 
+      - name: Run CI smoke tests
+        shell: msys2 {0}
+        run: |
+          python python_test/ci_test.py \
+            --dll build-mingw64/libtdjson.dll \
+            --tl  td/generate/scheme/td_api.tl
+
       - uses: actions/upload-artifact@v4
         with:
           name: libtdjson-windows
