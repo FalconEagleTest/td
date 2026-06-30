@@ -296,7 +296,7 @@ jobs:
           path: release-assets/
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.1
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "TDLib ${{ steps.tag.outputs.tag }}"
