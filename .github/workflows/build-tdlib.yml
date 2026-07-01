@@ -288,22 +288,15 @@ jobs:
 
       - name: Run host code generator (produces auto-generated .cpp files)
         run: |
-          # TDLib generates some .cpp files (mime types, tl-parser output etc.)
-          # at build time using the HOST compiler. Cross-compilation skips this
-          # step, so we run a native amd64 configure first just to generate them.
+          # TDLib generates mime-type .cpp files and TL bindings using the HOST
+          # compiler. These land in the SOURCE tree (tdutils/generate/auto/).
+          # We run a native configure + generate_common before cross-compiling.
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build gperf g++ libssl-dev zlib1g-dev php-cli
+            cmake ninja-build gperf g++ libssl-dev zlib1g-dev
           mkdir -p build-host
           cd build-host
           cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
-          ninja tl_generate_common generate_mime_types 2>/dev/null || ninja generate_common 2>/dev/null || true
-          # Copy generated files so the cross-build can find them
-          cd ..
-          find build-host -name "*.cpp" -path "*/auto/*" | while read f; do
-            rel="${f#build-host/}"
-            mkdir -p "build-linux-${{ matrix.arch }}/$(dirname $rel)"
-            cp "$f" "build-linux-${{ matrix.arch }}/$rel"
-          done
+          ninja tl_generate_common
 
       - name: Install cross-compiler + build tools
         run: |
@@ -339,15 +332,7 @@ jobs:
         run: |
           mkdir -p build-linux-${{ matrix.arch }}
           cd build-linux-${{ matrix.arch }}
-          # Locate ARM OpenSSL libraries installed by apt
-          OPENSSL_LIB=$(find /usr/lib/${{ matrix.triple }} -name "libssl.so" | head -1)
-          OPENSSL_CRYPTO=$(find /usr/lib/${{ matrix.triple }} -name "libcrypto.so" | head -1)
-          OPENSSL_INC=$(find /usr/include/${{ matrix.triple }} /usr/include -name "openssl" -type d 2>/dev/null | head -1 | xargs dirname)
-
-          echo "OpenSSL lib:    $OPENSSL_LIB"
-          echo "OpenSSL crypto: $OPENSSL_CRYPTO"
-          echo "OpenSSL inc:    $OPENSSL_INC"
-
+          # Paths are deterministic for apt-installed cross packages
           cmake .. \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -359,9 +344,9 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
             -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-            -DOPENSSL_SSL_LIBRARY="$OPENSSL_LIB" \
-            -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_CRYPTO" \
-            -DOPENSSL_INCLUDE_DIR="$OPENSSL_INC" \
+            -DOPENSSL_SSL_LIBRARY=/usr/lib/${{ matrix.triple }}/libssl.so \
+            -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/${{ matrix.triple }}/libcrypto.so \
+            -DOPENSSL_INCLUDE_DIR=/usr/include \
             -DZLIB_LIBRARY=/usr/lib/${{ matrix.triple }}/libz.so \
             -DZLIB_INCLUDE_DIR=/usr/include \
             -DTD_ENABLE_JNI=OFF
