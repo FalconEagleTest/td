@@ -141,31 +141,18 @@ jobs:
         run: |
           strip build-mingw64/libtdjson.dll
           mkdir -p artifacts/windows
-
-          # Copy the main DLL
           cp build-mingw64/libtdjson.dll artifacts/windows/
-
-          # Collect all MinGW64 runtime DLLs libtdjson.dll depends on.
-          # ldd lists the full path for DLLs found in the MSYS2 tree;
-          # we only copy ones that live under /mingw64 (not Windows system DLLs).
           ldd build-mingw64/libtdjson.dll \
             | awk '/\/mingw64\// {print $3}' \
             | xargs -I{} cp {} artifacts/windows/
-
           echo "=== Bundled DLLs ==="
           ls -lh artifacts/windows/
 
-          # Zip everything (7z is pre-installed on all Windows runners)
-          cd artifacts/windows
-          7z a -tzip ../libtdjson-windows.zip *.dll
-          cd ../..
-
-      - name: Run CI smoke tests
-        shell: msys2 {0}
+      - name: Zip DLLs + run smoke tests
+        # Default shell = pwsh on Windows — 7z and python are on PATH here
         run: |
-          python python_test/ci_test.py \
-            --dll build-mingw64/libtdjson.dll \
-            --tl  td/generate/scheme/td_api.tl
+          7z a -tzip artifacts/libtdjson-windows.zip artifacts/windows/*.dll
+          python python_test/ci_test.py --dll build-mingw64/libtdjson.dll --tl td/generate/scheme/td_api.tl
 
       - uses: actions/upload-artifact@v4
         with:
