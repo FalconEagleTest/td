@@ -320,6 +320,15 @@ jobs:
         run: |
           mkdir -p build-linux-${{ matrix.arch }}
           cd build-linux-${{ matrix.arch }}
+          # Locate ARM OpenSSL libraries installed by apt
+          OPENSSL_LIB=$(find /usr/lib/${{ matrix.triple }} -name "libssl.so" | head -1)
+          OPENSSL_CRYPTO=$(find /usr/lib/${{ matrix.triple }} -name "libcrypto.so" | head -1)
+          OPENSSL_INC=$(find /usr/include/${{ matrix.triple }} /usr/include -name "openssl" -type d 2>/dev/null | head -1 | xargs dirname)
+
+          echo "OpenSSL lib:    $OPENSSL_LIB"
+          echo "OpenSSL crypto: $OPENSSL_CRYPTO"
+          echo "OpenSSL inc:    $OPENSSL_INC"
+
           cmake .. \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -331,7 +340,9 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
             -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-            -DOPENSSL_ROOT_DIR=/usr/${{ matrix.triple }} \
+            -DOPENSSL_SSL_LIBRARY="$OPENSSL_LIB" \
+            -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_CRYPTO" \
+            -DOPENSSL_INCLUDE_DIR="$OPENSSL_INC" \
             -DZLIB_LIBRARY=/usr/lib/${{ matrix.triple }}/libz.so \
             -DZLIB_INCLUDE_DIR=/usr/include \
             -DTD_ENABLE_JNI=OFF
