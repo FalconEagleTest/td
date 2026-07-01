@@ -286,6 +286,25 @@ jobs:
         with:
           ref: production
 
+      - name: Run host code generator (produces auto-generated .cpp files)
+        run: |
+          # TDLib generates some .cpp files (mime types, tl-parser output etc.)
+          # at build time using the HOST compiler. Cross-compilation skips this
+          # step, so we run a native amd64 configure first just to generate them.
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gperf g++ libssl-dev zlib1g-dev php-cli
+          mkdir -p build-host
+          cd build-host
+          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
+          ninja tl_generate_common generate_mime_types 2>/dev/null || ninja generate_common 2>/dev/null || true
+          # Copy generated files so the cross-build can find them
+          cd ..
+          find build-host -name "*.cpp" -path "*/auto/*" | while read f; do
+            rel="${f#build-host/}"
+            mkdir -p "build-linux-${{ matrix.arch }}/$(dirname $rel)"
+            cp "$f" "build-linux-${{ matrix.arch }}/$rel"
+          done
+
       - name: Install cross-compiler + build tools
         run: |
           # 1. Restrict ALL existing apt sources to amd64 first
