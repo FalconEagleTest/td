@@ -46,6 +46,8 @@ jobs:
     name: Rebase production onto upstream
     runs-on: ubuntu-22.04
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.rebase_first || false }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,6 +62,7 @@ jobs:
           git remote add upstream https://github.com/tdlib/td.git
           git fetch upstream master
           git rebase upstream/master
+          # Rebase rewrites history so force push is required
           git push origin production --force-with-lease
 
 # ─────────────────────────────────────────────────────────────
