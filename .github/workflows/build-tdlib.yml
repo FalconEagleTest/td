@@ -301,10 +301,11 @@ jobs:
           mkdir -p build-host
           cd build-host
           cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DTDUTILS_MIME_TYPE=ON
-          # Generate both TL code and mime types
-          ninja tl_generate_common tdmime_auto
-          echo "=== Generated files in source tree ==="
+          # Generate all TL code (common, mtproto, json) + mime types
+          ninja tl_generate_common tl_generate_mtproto tl_generate_json tdmime_auto
+          echo "=== Generated files ==="
           ls ../tdutils/generate/auto/
+          ls ../td/generate/auto/ | head -10
 
       - name: Install cross-compiler + build tools
         run: |
