@@ -47,11 +47,11 @@ def run_tests(dll_path: Path, tl_path: Path) -> int:
     dll = None
     try:
         if os.name == "nt":
-            os.add_dll_directory(str(dll_path.parent))
+            os.add_dll_directory(str(dll_path.parent.resolve()))
             # MinGW64 runtime DLLs live in msys64/mingw64/bin
             msys_bin = Path("C:/msys64/mingw64/bin")
             if msys_bin.exists():
-                os.add_dll_directory(str(msys_bin))
+                os.add_dll_directory(str(msys_bin.resolve()))
         dll = ctypes.CDLL(str(dll_path))
         dll.td_json_client_create.restype  = ctypes.c_void_p
         dll.td_json_client_create.argtypes = []
