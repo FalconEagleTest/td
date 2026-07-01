@@ -152,7 +152,9 @@ jobs:
         # Default shell = pwsh on Windows — 7z and python are on PATH here
         run: |
           7z a -tzip artifacts/libtdjson-windows.zip artifacts/windows/*.dll
-          python python_test/ci_test.py --dll build-mingw64/libtdjson.dll --tl td/generate/scheme/td_api.tl
+          # Test against the DLL inside artifacts/windows where all runtime
+          # deps are co-located — not the bare build-mingw64/ directory
+          python python_test/ci_test.py --dll artifacts/windows/libtdjson.dll --tl td/generate/scheme/td_api.tl
 
       - uses: actions/upload-artifact@v4
         with:
