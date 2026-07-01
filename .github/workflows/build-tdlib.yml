@@ -1,0 +1,351 @@
+name: Build TDLib
+
+# ─────────────────────────────────────────────────────────────
+# Triggers
+# ─────────────────────────────────────────────────────────────
+on:
+  workflow_dispatch:
+    inputs:
+      rebase_first:
+        description: 'Rebase production onto upstream/master before building'
+        type: boolean
+        default: true
+      build_windows:
+        description: 'Build Windows MinGW64 DLL'
+        type: boolean
+        default: true
+      build_android:
+        description: 'Build Android arm64-v8a + armeabi-v7a .so'
+        type: boolean
+        default: true
+      create_release:
+        description: 'Create a GitHub Release with the built artifacts'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Release tag override. Leave empty to auto-generate from TDLib version + date (e.g. v1.8.65-20260630)'
+        type: string
+        default: ''
+
+  push:
+    branches: [production]
+    paths:
+      # Only rebuild when actual TDLib C++ source changes.
+      # Workflow/script/doc changes do NOT trigger a rebuild.
+      - 'td/**'
+      - 'tdutils/**'
+      - 'tdactor/**'
+      - 'tddb/**'
+      - 'tdtl/**'
+      - 'tdjson/**'
+      - 'CMakeLists.txt'
+      - 'td/generate/scheme/td_api.tl'
+
+env:
+  NDK_R: r23c
+  NDK_VER: 23.2.8568313
+  # Bump this string whenever you want to force-invalidate all caches
+  CACHE_EPOCH: '1'
+
+# ─────────────────────────────────────────────────────────────
+# Job 1 – Optional rebase
+# ─────────────────────────────────────────────────────────────
+jobs:
+  rebase:
+    name: Rebase production onto upstream
+    runs-on: ubuntu-22.04
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rebase_first || false }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote and rebase
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/tdlib/td.git
+          git fetch upstream master
+          git rebase upstream/master
+          git push origin production --force-with-lease
+
+# ─────────────────────────────────────────────────────────────
+# Job 2 – Windows MinGW64 DLL
+# ─────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows (MinGW64)
+    runs-on: windows-2022
+    needs: [rebase]
+    # Run if rebase succeeded or was skipped, AND windows build requested.
+    if: |
+      always() &&
+      (needs.rebase.result == 'success' || needs.rebase.result == 'skipped') &&
+      (github.event_name != 'workflow_dispatch' || inputs.build_windows)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production
+
+      - name: Install MSYS2 + MinGW64 toolchain
+        uses: msys2/setup-msys2@v2.32.0
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-gperf
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-zlib
+            git
+
+      # Cache the entire build directory.
+      # Key includes CMakeLists.txt + all C++ source hashes so a pure
+      # comment/doc commit skips the compile step entirely.
+      - name: Restore Windows build cache
+        id: win-cache
+        uses: actions/cache@v4
+        with:
+          path: build-mingw64
+          key: win-mingw64-${{ env.CACHE_EPOCH }}-${{ hashFiles('CMakeLists.txt', 'td/**/*.cpp', 'td/**/*.h', 'td/**/*.cc') }}
+          restore-keys: |
+            win-mingw64-${{ env.CACHE_EPOCH }}-
+
+      - name: Build libtdjson.dll (incremental)
+        shell: msys2 {0}
+        run: |
+          mkdir -p build-mingw64
+          cd build-mingw64
+          cmake .. \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=../install-mingw64 \
+            -DOPENSSL_ROOT_DIR=/mingw64 \
+            -DZLIB_ROOT=/mingw64 \
+            -DTD_ENABLE_JNI=OFF \
+            -DENABLE_UPNP=OFF \
+            -DENABLE_AIRTUNES=OFF \
+            -DENABLE_OPTICAL=OFF \
+            -DENABLE_DVDCSS=OFF
+          ninja tdjson -j$(nproc)
+
+      - name: Strip + collect DLL + MinGW runtime deps
+        shell: msys2 {0}
+        run: |
+          strip build-mingw64/libtdjson.dll
+          mkdir -p artifacts/windows
+
+          # Copy the main DLL
+          cp build-mingw64/libtdjson.dll artifacts/windows/
+
+          # Collect all MinGW64 runtime DLLs libtdjson.dll depends on.
+          # ldd lists the full path for DLLs found in the MSYS2 tree;
+          # we only copy ones that live under /mingw64 (not Windows system DLLs).
+          ldd build-mingw64/libtdjson.dll \
+            | awk '/\/mingw64\// {print $3}' \
+            | xargs -I{} cp {} artifacts/windows/
+
+          echo "=== Bundled DLLs ==="
+          ls -lh artifacts/windows/
+
+          # Zip everything for clean download (use python, zip not always available)
+          python -c "
+import zipfile, pathlib, sys
+out = pathlib.Path('artifacts/libtdjson-windows.zip')
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+    for f in pathlib.Path('artifacts/windows').glob('*.dll'):
+        z.write(f, f.name)
+        print(f'  added {f.name} ({f.stat().st_size//1024}K)')
+print(f'Created {out} ({out.stat().st_size//1024}K)')
+"
+
+      - name: Run CI smoke tests
+        shell: msys2 {0}
+        run: |
+          python python_test/ci_test.py \
+            --dll build-mingw64/libtdjson.dll \
+            --tl  td/generate/scheme/td_api.tl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libtdjson-windows
+          path: artifacts/libtdjson-windows.zip
+          retention-days: 30
+
+# ─────────────────────────────────────────────────────────────
+# Job 3 – Android arm64-v8a + armeabi-v7a
+# ─────────────────────────────────────────────────────────────
+  build-android:
+    name: Android (arm64 + armv7)
+    runs-on: ubuntu-22.04
+    needs: [rebase]
+    if: |
+      always() &&
+      (needs.rebase.result == 'success' || needs.rebase.result == 'skipped') &&
+      (github.event_name != 'workflow_dispatch' || inputs.build_android)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gperf ccache unzip curl
+
+      # ── NDK cache ───────────────────────────────────────────
+      - name: Restore NDK cache
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: example/android/SDK/ndk/${{ env.NDK_VER }}
+          key: ndk-${{ env.NDK_R }}-${{ env.NDK_VER }}
+
+      - name: Download + extract NDK (if not cached)
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p example/android/SDK/ndk
+          NDK_ZIP=/tmp/android-ndk-${{ env.NDK_R }}-linux.zip
+          curl -L --fail --progress-bar \
+            -o "$NDK_ZIP" \
+            "https://dl.google.com/android/repository/android-ndk-${{ env.NDK_R }}-linux.zip"
+          unzip -q "$NDK_ZIP" -d example/android/SDK/ndk
+          mv "example/android/SDK/ndk/android-ndk-${{ env.NDK_R }}" \
+             "example/android/SDK/ndk/${{ env.NDK_VER }}"
+
+      # ── OpenSSL cache ────────────────────────────────────────
+      # Key = NDK version + the openssl submodule SHA so a submodule
+      # bump invalidates the cache automatically.
+      - name: Resolve OpenSSL submodule SHA
+        id: openssl-sha
+        run: |
+          SHA=$(git -C example/android ls-files -s -- third-party/openssl 2>/dev/null | awk '{print $2}' || echo "none")
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Restore OpenSSL cache
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: example/android/third-party/openssl
+          key: android-openssl-${{ env.CACHE_EPOCH }}-${{ env.NDK_R }}-${{ steps.openssl-sha.outputs.sha }}
+
+      - name: Build OpenSSL for Android (if not cached)
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        working-directory: example/android
+        run: |
+          # Restrict to Kodi ABIs only
+          sed -i 's/^for ABI in arm64-v8a armeabi-v7a x86_64 x86 ; do/for ABI in arm64-v8a armeabi-v7a ; do/' \
+            build-openssl.sh build-tdlib.sh
+          ./build-openssl.sh SDK
+
+      - name: Patch ABI restriction (if OpenSSL was cached)
+        if: steps.openssl-cache.outputs.cache-hit == 'true'
+        working-directory: example/android
+        run: |
+          sed -i 's/^for ABI in arm64-v8a armeabi-v7a x86_64 x86 ; do/for ABI in arm64-v8a armeabi-v7a ; do/' \
+            build-openssl.sh build-tdlib.sh
+
+      # ── TDLib build cache ────────────────────────────────────
+      - name: Restore TDLib Android build cache
+        id: tdlib-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            example/android/build-arm64-v8a-JSON
+            example/android/build-armeabi-v7a-JSON
+          key: android-tdlib-${{ env.CACHE_EPOCH }}-${{ env.NDK_R }}-${{ hashFiles('CMakeLists.txt', 'td/**/*.cpp', 'td/**/*.h') }}
+          restore-keys: |
+            android-tdlib-${{ env.CACHE_EPOCH }}-${{ env.NDK_R }}-
+
+      - name: Build TDLib JSON for Android (incremental)
+        working-directory: example/android
+        run: |
+          ./build-tdlib.sh SDK "" "" "" "JSON"
+
+      - name: Collect .so artifacts + zip
+        run: |
+          mkdir -p artifacts/android
+          cp example/android/tdlib/libs/arm64-v8a/libtdjson.so \
+             artifacts/android/libtdjsonjava64.so
+          cp example/android/tdlib/libs/armeabi-v7a/libtdjson.so \
+             artifacts/android/libtdjsonjava32.so
+          ls -lh artifacts/android/
+          python3 -c "
+import zipfile, pathlib
+out = pathlib.Path('artifacts/libtdjson-android.zip')
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+    for f in pathlib.Path('artifacts/android').glob('*.so'):
+        z.write(f, f.name)
+        print(f'  added {f.name} ({f.stat().st_size//1024}K)')
+print(f'Created {out} ({out.stat().st_size//1024}K)')
+"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libtdjson-android
+          path: artifacts/libtdjson-android.zip
+          retention-days: 30
+
+# ─────────────────────────────────────────────────────────────
+# Job 4 – Create/update GitHub Release
+# ─────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    needs: [build-windows, build-android]
+    if: |
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.create_release &&
+      (needs.build-windows.result == 'success' || needs.build-android.result == 'success')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production
+
+      # Auto-generate tag from TDLib version + today's date if not overridden.
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            echo "tag=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            VERSION=$(grep -m1 'project(TDLib VERSION' CMakeLists.txt | grep -oP '[\d.]+')
+            DATE=$(date +%Y%m%d)
+            echo "tag=v${VERSION}-${DATE}" >> $GITHUB_OUTPUT
+          fi
+          echo "Resolved tag: $(cat $GITHUB_OUTPUT | grep tag= | cut -d= -f2)"
+
+      - name: Download Windows artifact
+        if: needs.build-windows.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: libtdjson-windows
+          path: release-assets/
+
+      - name: Download Android artifacts
+        if: needs.build-android.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: libtdjson-android
+          path: release-assets/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3.0.1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "TDLib ${{ steps.tag.outputs.tag }}"
+          body: |
+            TDLib 1.8.65 fork build — readFileRemotePart streaming + file_hashes CDN verification.
+
+            **Files:**
+            - `libtdjson.dll` — Windows x64 (MinGW64)
+            - `libtdjsonjava64.so` — Android arm64-v8a
+            - `libtdjsonjava32.so` — Android armeabi-v7a
+          files: release-assets/*
+          draft: false
+          prerelease: false
