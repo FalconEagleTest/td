@@ -22,6 +22,10 @@ on:
         description: 'Build Linux ARM64 + ARMhf .so (Raspberry Pi / CoreELEC)'
         type: boolean
         default: false
+      build_linux_x64:
+        description: 'Build Linux x64 .so (PC / server)'
+        type: boolean
+        default: false
       create_release:
         description: 'Create a GitHub Release with the built artifacts'
         type: boolean
@@ -366,17 +370,70 @@ jobs:
           retention-days: 30
 
 # ─────────────────────────────────────────────────────────────
-# Job 5 – Create/update GitHub Release
+# Job 5 – Linux x64 (PC / server)
+# ─────────────────────────────────────────────────────────────
+  build-linux-x64:
+    name: Linux x64 (PC)
+    runs-on: ubuntu-22.04
+    needs: [rebase]
+    if: |
+      always() &&
+      (needs.rebase.result == 'success' || needs.rebase.result == 'skipped') &&
+      (github.event_name != 'workflow_dispatch' || inputs.build_linux_x64)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gperf g++ libssl-dev zlib1g-dev
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build-linux-x64
+          key: linux-x64-${{ env.CACHE_EPOCH }}-${{ hashFiles('CMakeLists.txt', 'td/**/*.cpp', 'td/**/*.h') }}
+          restore-keys: |
+            linux-x64-${{ env.CACHE_EPOCH }}-
+
+      - name: Build libtdjson.so (x64)
+        run: |
+          mkdir -p build-linux-x64
+          cd build-linux-x64
+          cmake .. \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTD_ENABLE_JNI=OFF
+          ninja tdjson -j$(nproc)
+          strip --strip-unneeded libtdjson.so
+
+      - name: Collect artifact
+        run: |
+          mkdir -p artifacts
+          cp build-linux-x64/libtdjson.so artifacts/libtdjson-linux-x64.so
+          ls -lh artifacts/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libtdjson-linux-x64
+          path: artifacts/libtdjson-linux-x64.so
+          retention-days: 30
+
+# ─────────────────────────────────────────────────────────────
+# Job 6 – Create/update GitHub Release
 # ─────────────────────────────────────────────────────────────
   release:
     name: Create GitHub Release
     runs-on: ubuntu-22.04
-    needs: [build-windows, build-android, build-linux-arm]
+    needs: [build-windows, build-android, build-linux-arm, build-linux-x64]
     if: |
       always() &&
       github.event_name == 'workflow_dispatch' &&
       inputs.create_release &&
-      (needs.build-windows.result == 'success' || needs.build-android.result == 'success' || needs.build-linux-arm.result == 'success')
+      (needs.build-windows.result == 'success' || needs.build-android.result == 'success' || needs.build-linux-arm.result == 'success' || needs.build-linux-x64.result == 'success')
     steps:
       - uses: actions/checkout@v4
         with:
@@ -423,6 +480,13 @@ jobs:
           name: libtdjson-linux-armhf
           path: release-assets/
 
+      - name: Download Linux x64 artifact
+        if: needs.build-linux-x64.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: libtdjson-linux-x64
+          path: release-assets/
+
       - name: Create release
         uses: softprops/action-gh-release@v3.0.1
         with:
@@ -434,6 +498,7 @@ jobs:
             **Files:**
             - `libtdjson-windows.zip` — Windows x64 (MinGW64 + runtime DLLs)
             - `libtdjson-android.zip` — Android arm64-v8a + armeabi-v7a
+            - `libtdjson-linux-x64.so` — Linux x64 (PC / server)
             - `libtdjson-linux-arm64.so` — Linux ARM64 (Raspberry Pi 4/5, CoreELEC)
             - `libtdjson-linux-armhf.so` — Linux ARMhf (Raspberry Pi 2/3, LibreELEC 32-bit)
           files: release-assets/*
