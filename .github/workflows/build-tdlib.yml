@@ -31,19 +31,6 @@ on:
         type: string
         default: ''
 
-  push:
-    branches: [production]
-    paths:
-      # Only rebuild when actual TDLib C++ source changes.
-      # Workflow/script/doc changes do NOT trigger a rebuild.
-      - 'td/**'
-      - 'tdutils/**'
-      - 'tdactor/**'
-      - 'tddb/**'
-      - 'tdtl/**'
-      - 'tdjson/**'
-      - 'CMakeLists.txt'
-      - 'td/generate/scheme/td_api.tl'
 
 env:
   NDK_R: r23c
