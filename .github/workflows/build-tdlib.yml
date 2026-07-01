@@ -18,6 +18,10 @@ on:
         description: 'Build Android arm64-v8a + armeabi-v7a .so'
         type: boolean
         default: true
+      build_linux_arm:
+        description: 'Build Linux ARM64 + ARMhf .so (Raspberry Pi / CoreELEC)'
+        type: boolean
+        default: false
       create_release:
         description: 'Create a GitHub Release with the built artifacts'
         type: boolean
@@ -277,17 +281,92 @@ jobs:
           retention-days: 30
 
 # ─────────────────────────────────────────────────────────────
-# Job 4 – Create/update GitHub Release
+# Job 4 – Linux ARM64 + ARMhf (Raspberry Pi / CoreELEC)
+# ─────────────────────────────────────────────────────────────
+  build-linux-arm:
+    name: Linux ARM (Raspberry Pi / CoreELEC)
+    runs-on: ubuntu-22.04
+    needs: [rebase]
+    if: |
+      always() &&
+      (needs.rebase.result == 'success' || needs.rebase.result == 'skipped') &&
+      (github.event_name != 'workflow_dispatch' || inputs.build_linux_arm)
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64     # Pi 4/5, CoreELEC arm64
+            triple: aarch64-linux-gnu
+            out: libtdjson-linux-arm64.so
+          - arch: armhf       # Pi 2/3, LibreELEC 32-bit
+            triple: arm-linux-gnueabihf
+            out: libtdjson-linux-armhf.so
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production
+
+      - name: Install cross-compiler + build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gperf \
+            gcc-${{ matrix.triple }} g++-${{ matrix.triple }} \
+            libssl-dev zlib1g-dev
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build-linux-${{ matrix.arch }}
+          key: linux-${{ matrix.arch }}-${{ env.CACHE_EPOCH }}-${{ hashFiles('CMakeLists.txt', 'td/**/*.cpp', 'td/**/*.h') }}
+          restore-keys: |
+            linux-${{ matrix.arch }}-${{ env.CACHE_EPOCH }}-
+
+      - name: Build libtdjson.so (${{ matrix.arch }})
+        run: |
+          mkdir -p build-linux-${{ matrix.arch }}
+          cd build-linux-${{ matrix.arch }}
+          cmake .. \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
+            -DCMAKE_C_COMPILER=${{ matrix.triple }}-gcc \
+            -DCMAKE_CXX_COMPILER=${{ matrix.triple }}-g++ \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DTD_ENABLE_JNI=OFF \
+            -DENABLE_UPNP=OFF \
+            -DENABLE_AIRTUNES=OFF \
+            -DENABLE_OPTICAL=OFF \
+            -DENABLE_DVDCSS=OFF
+          ninja tdjson -j$(nproc)
+          ${{ matrix.triple }}-strip --strip-unneeded libtdjson.so
+
+      - name: Collect artifact
+        run: |
+          mkdir -p artifacts
+          cp build-linux-${{ matrix.arch }}/libtdjson.so artifacts/${{ matrix.out }}
+          ls -lh artifacts/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libtdjson-linux-${{ matrix.arch }}
+          path: artifacts/${{ matrix.out }}
+          retention-days: 30
+
+# ─────────────────────────────────────────────────────────────
+# Job 5 – Create/update GitHub Release
 # ─────────────────────────────────────────────────────────────
   release:
     name: Create GitHub Release
     runs-on: ubuntu-22.04
-    needs: [build-windows, build-android]
+    needs: [build-windows, build-android, build-linux-arm]
     if: |
       always() &&
       github.event_name == 'workflow_dispatch' &&
       inputs.create_release &&
-      (needs.build-windows.result == 'success' || needs.build-android.result == 'success')
+      (needs.build-windows.result == 'success' || needs.build-android.result == 'success' || needs.build-linux-arm.result == 'success')
     steps:
       - uses: actions/checkout@v4
         with:
@@ -320,6 +399,20 @@ jobs:
           name: libtdjson-android
           path: release-assets/
 
+      - name: Download Linux ARM64 artifact
+        if: needs.build-linux-arm.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: libtdjson-linux-aarch64
+          path: release-assets/
+
+      - name: Download Linux ARMhf artifact
+        if: needs.build-linux-arm.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: libtdjson-linux-armhf
+          path: release-assets/
+
       - name: Create release
         uses: softprops/action-gh-release@v3.0.1
         with:
@@ -329,9 +422,10 @@ jobs:
             TDLib 1.8.65 fork build — readFileRemotePart streaming + file_hashes CDN verification.
 
             **Files:**
-            - `libtdjson.dll` — Windows x64 (MinGW64)
-            - `libtdjsonjava64.so` — Android arm64-v8a
-            - `libtdjsonjava32.so` — Android armeabi-v7a
+            - `libtdjson-windows.zip` — Windows x64 (MinGW64 + runtime DLLs)
+            - `libtdjson-android.zip` — Android arm64-v8a + armeabi-v7a
+            - `libtdjson-linux-arm64.so` — Linux ARM64 (Raspberry Pi 4/5, CoreELEC)
+            - `libtdjson-linux-armhf.so` — Linux ARMhf (Raspberry Pi 2/3, LibreELEC 32-bit)
           files: release-assets/*
           draft: false
           prerelease: false
