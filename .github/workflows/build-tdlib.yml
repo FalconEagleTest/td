@@ -292,15 +292,19 @@ jobs:
 
       - name: Run host code generator (produces auto-generated .cpp files)
         run: |
-          # TDLib generates mime-type .cpp files and TL bindings using the HOST
-          # compiler. These land in the SOURCE tree (tdutils/generate/auto/).
-          # We run a native configure + generate_common before cross-compiling.
+          # mime_type_to_extension.cpp and TL bindings are generated at build time
+          # using gperf + the host compiler. Cross-compile builds skip this step
+          # (CMake skips MIME gen when CMAKE_CROSSCOMPILING=TRUE), so we must
+          # run a native host build first to populate tdutils/generate/auto/.
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build gperf g++ libssl-dev zlib1g-dev
           mkdir -p build-host
           cd build-host
-          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
-          ninja tl_generate_common
+          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DTDUTILS_MIME_TYPE=ON
+          # Generate both TL code and mime types
+          ninja tl_generate_common tdmime_auto
+          echo "=== Generated files in source tree ==="
+          ls ../tdutils/generate/auto/
 
       - name: Install cross-compiler + build tools
         run: |
