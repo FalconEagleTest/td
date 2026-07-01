@@ -151,16 +151,8 @@ jobs:
           echo "=== Bundled DLLs ==="
           ls -lh artifacts/windows/
 
-          # Zip everything for clean download (use python, zip not always available)
-          python -c "
-import zipfile, pathlib, sys
-out = pathlib.Path('artifacts/libtdjson-windows.zip')
-with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
-    for f in pathlib.Path('artifacts/windows').glob('*.dll'):
-        z.write(f, f.name)
-        print(f'  added {f.name} ({f.stat().st_size//1024}K)')
-print(f'Created {out} ({out.stat().st_size//1024}K)')
-"
+          # Zip everything for clean download
+          python python_test/make_zip.py artifacts/windows artifacts/libtdjson-windows.zip
 
       - name: Run CI smoke tests
         shell: msys2 {0}
@@ -274,15 +266,7 @@ print(f'Created {out} ({out.stat().st_size//1024}K)')
           cp example/android/tdlib/libs/armeabi-v7a/libtdjson.so \
              artifacts/android/libtdjsonjava32.so
           ls -lh artifacts/android/
-          python3 -c "
-import zipfile, pathlib
-out = pathlib.Path('artifacts/libtdjson-android.zip')
-with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
-    for f in pathlib.Path('artifacts/android').glob('*.so'):
-        z.write(f, f.name)
-        print(f'  added {f.name} ({f.stat().st_size//1024}K)')
-print(f'Created {out} ({out.stat().st_size//1024}K)')
-"
+          python3 python_test/make_zip.py artifacts/android artifacts/libtdjson-android.zip
 
       - uses: actions/upload-artifact@v4
         with:
