@@ -151,8 +151,10 @@ jobs:
           echo "=== Bundled DLLs ==="
           ls -lh artifacts/windows/
 
-          # Zip everything for clean download
-          python python_test/make_zip.py artifacts/windows artifacts/libtdjson-windows.zip
+          # Zip everything (7z is pre-installed on all Windows runners)
+          cd artifacts/windows
+          7z a -tzip ../libtdjson-windows.zip *.dll
+          cd ../..
 
       - name: Run CI smoke tests
         shell: msys2 {0}
@@ -266,7 +268,7 @@ jobs:
           cp example/android/tdlib/libs/armeabi-v7a/libtdjson.so \
              artifacts/android/libtdjsonjava32.so
           ls -lh artifacts/android/
-          python3 python_test/make_zip.py artifacts/android artifacts/libtdjson-android.zip
+          cd artifacts/android && zip ../libtdjson-android.zip *.so && cd ../..
 
       - uses: actions/upload-artifact@v4
         with:
