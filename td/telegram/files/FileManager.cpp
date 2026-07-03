@@ -4812,7 +4812,7 @@ FileType FileManager::guess_file_type(const tl_object_ptr<td_api::InputFile> &fi
   }
 }
 
-vector<tl_object_ptr<telegram_api::InputDocument>> FileManager::get_input_documents(const vector<FileId> &file_ids) {
+vector<tl_object_ptr<telegram_api::InputDocument>> FileManager::get_input_documents(const vector<FileId> &file_ids) const {
   vector<tl_object_ptr<telegram_api::InputDocument>> result;
   result.reserve(file_ids.size());
   for (auto file_id : file_ids) {
