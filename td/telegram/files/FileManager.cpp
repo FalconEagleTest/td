@@ -310,24 +310,26 @@ void FileManager::download_stream_part(FileId file_id, int64 offset, int32 count
   };
 
   // ── Check the read-ahead prefetch slot ──────────────────────────────────
+  // We only use the slot for READY cache hits. We never join an in-flight
+  // prefetch as a waiter because doing so creates a double-fulfillment race:
+  // if the slot is cleared (e.g. a seek arrives) the waiter's Promise is
+  // destroyed → send_error(id), and then the original main actor also calls
+  // send_result(id) → LOG(FATAL) "Lost promise". Simpler and crash-free:
+  // on a MISS or in-flight, always create a fresh main actor. Two actors may
+  // race for the same chunk, but both paths are safe and TDLib deduplicates.
   auto &slot = stream_prefetch_;
-  if (slot.file_id == file_id && slot.offset == offset && slot.count == count) {
-    if (slot.ready) {
-      // Cache hit — return instantly, then kick off the next prefetch.
-      auto raw_promise = wrap_promise(std::move(promise));
-      int64 next_offset = offset + count;
-      string data = std::move(slot.data);
-      Status error = std::move(slot.error);
-      slot = StreamPrefetchSlot{};  // clear before starting next prefetch
-      start_stream_prefetch(file_id, next_offset, count);
-      if (error.is_ok()) {
-        raw_promise.set_value(std::move(data));
-      } else {
-        raw_promise.set_error(std::move(error));
-      }
+  if (slot.file_id == file_id && slot.offset == offset && slot.count == count && slot.ready) {
+    // Cache hit — return instantly, then kick off the next prefetch.
+    auto raw_promise = wrap_promise(std::move(promise));
+    int64 next_offset = offset + count;
+    string data = std::move(slot.data);
+    Status error = std::move(slot.error);
+    slot = StreamPrefetchSlot{};  // clear before starting next prefetch
+    start_stream_prefetch(file_id, next_offset, count);
+    if (error.is_ok()) {
+      raw_promise.set_value(std::move(data));
     } else {
-      // In-flight — enqueue; on_stream_prefetch_done will fulfill it.
-      slot.waiters.push_back(wrap_promise(std::move(promise)));
+      raw_promise.set_error(std::move(error));
     }
     return;
   }
@@ -359,7 +361,9 @@ void FileManager::download_stream_part(FileId file_id, int64 offset, int32 count
           return;
         }
         raw_promise.set_value(r.move_as_ok());
-        // Trigger prefetch for the next chunk on the FileManager actor thread.
+        // Kick off the next-chunk prefetch after the current one completes.
+        // On-completion start is safe: no extra actor is created until the
+        // current one is done, keeping total inflight actors bounded.
         send_closure(actor_id, &FileManager::start_stream_prefetch,
                      file_id, next_offset, count);
       });
@@ -367,6 +371,13 @@ void FileManager::download_stream_part(FileId file_id, int64 offset, int32 count
   create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, count,
                                    *remote_ptr, actor_id(this),
                                    std::move(actor_promise)).release();
+
+  // NOTE: We intentionally do NOT start a prefetch here on cache miss.
+  // Starting one alongside the main request would create 2x actors, which
+  // overwhelms Telegram rate limits with parallel workers. Prefetch is
+  // instead triggered from the cache-HIT path (download_stream_part above)
+  // and from on_stream_prefetch_done, building up pipeline depth organically
+  // after the first sequential cache-hit is confirmed.
 }
 
 void FileManager::start_stream_prefetch(FileId file_id, int64 next_offset, int32 count) {
@@ -431,16 +442,9 @@ void FileManager::on_stream_prefetch_done(FileId file_id, int64 offset, Result<s
             << " offset=" << offset
             << (slot.error.is_ok() ? " ok" : " error");
 
-  // Fulfill any callers that joined the waiters list while we were fetching.
-  for (auto &w : slot.waiters) {
-    if (slot.error.is_ok()) {
-      w.set_value(slot.data);  // copy — each waiter gets its own string
-    } else {
-      w.set_error(slot.error.clone());
-    }
-  }
-  slot.waiters.clear();
-  // Leave slot.ready=true so the NEXT caller gets an instant hit.
+  // Leave slot.ready=true so the NEXT caller that asks for this offset
+  // gets an instant hit via the cache-hit path in download_stream_part.
+  // We never use the waiter path, so slot.waiters is always empty here.
 }
 
 void FileManager::repair_stream_file_reference(FileId file_id, string bad_reference,

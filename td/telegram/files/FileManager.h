@@ -901,7 +901,8 @@ class FileManager final : public Actor {
     bool    ready{false};
     string  data;
     Status  error;
-    vector<Promise<string>> waiters;  // callers that arrived while inflight
+    // No waiters — we always create a fresh actor on miss or in-flight.
+    // See download_stream_part for the safety rationale.
   } stream_prefetch_;
 
   std::set<std::string> bad_paths_;

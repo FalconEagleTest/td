@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import ctypes
 import hashlib
 import json
 import os
+import queue
 import random
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -32,6 +35,7 @@ DEFAULT_DLL = TD_REPO / "build-mingw64" / "libtdjson.dll"
 SESSION_DIR = HERE / "session"
 DOWNLOAD_DIR = HERE / "downloads"
 CACHE_FILE = SESSION_DIR / "link_cache.json"
+TDLIB_LOG_FILE = SESSION_DIR / "tdlib.log"
 SESSION_DIR.mkdir(exist_ok=True)
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -59,47 +63,190 @@ def load_tdjson(dll_path: Path):
     tdjson.td_json_client_receive.argtypes = [ctypes.c_void_p, ctypes.c_double]
     tdjson.td_json_client_destroy.restype = None
     tdjson.td_json_client_destroy.argtypes = [ctypes.c_void_p]
-    tdjson.td_set_log_verbosity_level.restype = None
-    tdjson.td_set_log_verbosity_level.argtypes = [ctypes.c_int]
-    tdjson.td_set_log_verbosity_level(1)
+    tdjson.td_json_client_execute.restype = ctypes.c_char_p
+    tdjson.td_json_client_execute.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    # Verbosity 2 = warnings. The C++ patch emits "[stream_diag]" lines
+    # at WARNING so we can count CDN-vs-direct responses post-hoc.
+    # Use td_json_client_execute (td_set_log_verbosity_level removed in 1.8+).
+    _set_verb = json.dumps({"@type": "setLogVerbosityLevel",
+                            "new_verbosity_level": 2}).encode("utf-8")
+    tdjson.td_json_client_execute(None, _set_verb)
+
+    # Redirect log to a file so we can grep [stream_diag] later.
+    # Truncate previous run's log.
+    try:
+        TDLIB_LOG_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    set_log = json.dumps({
+        "@type": "setLogStream",
+        "log_stream": {
+            "@type": "logStreamFile",
+            "path": str(TDLIB_LOG_FILE),
+            "max_file_size": 50 * 1024 * 1024,
+            "redirect_stderr": False,
+        },
+    }).encode("utf-8")
+    tdjson.td_json_client_execute(None, set_log)
     return tdjson
 
 
+_STREAM_DIAG_EVENTS = (
+    "upload_file",          # direct DC response, no CDN
+    "cdn_redirect",         # primary DC told us to fetch from CDN
+    "upload_cdnFile",       # successful CDN fetch (decrypted)
+    "cdn_reupload_needed",  # CDN said "reupload first"
+    "cdn_reuploaded",       # primary DC confirmed reupload
+    "cdn_sim_decrypt",      # TD_STREAM_FORCE_CDN_SIM=1 round-trip check
+)
+
+
+def count_stream_diag(log_path: Path = TDLIB_LOG_FILE) -> dict:
+    """Tally [stream_diag] events from the TDLib log."""
+    counts = {ev: 0 for ev in _STREAM_DIAG_EVENTS}
+    if not log_path.exists():
+        return {**counts, "total": 0, "log_missing": True}
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if "[stream_diag]" not in line:
+                continue
+            for ev in _STREAM_DIAG_EVENTS:
+                if f"] {ev} " in line:
+                    counts[ev] += 1
+                    break
+    counts["total"] = sum(counts[ev] for ev in _STREAM_DIAG_EVENTS)
+    return counts
+
+
+def print_stream_diag(prev: dict | None = None) -> dict:
+    """Print the current stream_diag counts; if `prev` is given, show
+    the delta relative to it (so multiple runs share one log file)."""
+    cur = count_stream_diag()
+    if prev is None:
+        delta = cur
+    else:
+        delta = {k: cur.get(k, 0) - prev.get(k, 0) for k in cur}
+        delta["total"] = sum(delta[ev] for ev in _STREAM_DIAG_EVENTS)
+    print("\n--- stream_diag (from TDLib log) ---")
+    if delta.get("total", 0) == 0:
+        print("  no chunks observed — log empty or missing")
+        return cur
+    direct = delta["upload_file"]
+    cdn_first = delta["cdn_redirect"]
+    cdn_data = delta["upload_cdnFile"]
+    cdn_reup_need = delta["cdn_reupload_needed"]
+    cdn_reup_done = delta["cdn_reuploaded"]
+    cdn_sim = delta["cdn_sim_decrypt"]
+    print(f"  direct (upload_file)            : {direct}")
+    print(f"  CDN redirects observed          : {cdn_first}")
+    print(f"  CDN bytes decrypted             : {cdn_data}")
+    print(f"  CDN reupload required           : {cdn_reup_need}")
+    print(f"  CDN reupload completed          : {cdn_reup_done}")
+    if cdn_sim > 0:
+        print(f"  cdn_sim_decrypt roundtrips      : {cdn_sim}")
+    if cdn_data > 0 or cdn_first > 0:
+        print(f"  -> CDN code path was exercised")
+    elif cdn_sim > 0:
+        print(f"  -> CDN math validated via "
+              f"TD_STREAM_FORCE_CDN_SIM (no real CDN file hit)")
+    else:
+        print(f"  -> CDN code path NOT exercised (file is not CDN-cached)")
+    return cur
+
+
 class TDClient:
+    """Thread-safe TDLib client.
+
+    One background thread does `td_json_client_receive` and routes
+    events to per-call Futures keyed by `@extra`. Lets `call()` be
+    invoked from multiple threads concurrently — needed for the
+    parallel-chunk throughput benchmark and for any client that wants
+    to overlap requests with the receive loop.
+    """
     def __init__(self, tdjson):
         self._td = tdjson
         self._client = tdjson.td_json_client_create()
+        self._waiters: dict[int, concurrent.futures.Future] = {}
+        self._waiter_lock = threading.Lock()
+        self._auth_q: "queue.Queue[dict]" = queue.Queue()
+        self._auth_mode = True  # while True, also tee events to _auth_q
+        self._stop_recv = False
+        self._recv_thread = threading.Thread(
+            target=self._receive_loop, daemon=True, name="td-recv")
+        self._recv_thread.start()
+
+    def _receive_loop(self) -> None:
+        while not self._stop_recv:
+            try:
+                raw = self._td.td_json_client_receive(self._client, 0.5)
+            except Exception:
+                continue
+            if not raw:
+                continue
+            try:
+                evt = json.loads(raw.decode("utf-8"))
+            except Exception:
+                continue
+            extra = evt.get("@extra")
+            delivered = False
+            if extra is not None:
+                with self._waiter_lock:
+                    fut = self._waiters.pop(extra, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(evt)
+                    delivered = True
+            # During the auth dance, also expose every event so the
+            # state-machine driver can see updateAuthorizationState
+            # and the various "error" events.
+            if self._auth_mode and not delivered:
+                self._auth_q.put(evt)
 
     def send(self, query: dict) -> None:
         self._td.td_json_client_send(
             self._client, json.dumps(query).encode("utf-8"))
 
     def receive(self, timeout: float = 1.0) -> dict | None:
-        raw = self._td.td_json_client_receive(self._client, timeout)
-        if not raw:
+        """Used only during the auth state-machine before _auth_mode flips."""
+        try:
+            return self._auth_q.get(timeout=timeout)
+        except Exception:
             return None
-        return json.loads(raw.decode("utf-8"))
+
+    def end_auth_mode(self) -> None:
+        """After login, stop teeing events into the auth queue."""
+        self._auth_mode = False
 
     def call(self, query: dict, timeout: float = 30.0) -> dict:
-        """Send a query and wait for the matching @extra response."""
+        """Send a query, wait for the matching @extra response.
+
+        Safe to call from multiple threads concurrently.
+        """
         extra = random.randint(1, 2**31 - 1)
         query = dict(query, **{"@extra": extra})
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        with self._waiter_lock:
+            self._waiters[extra] = fut
         self.send(query)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            evt = self.receive(0.5)
-            if not evt:
-                continue
-            if evt.get("@extra") == extra:
-                if evt.get("@type") == "error":
-                    raise RuntimeError(
-                        f"{query['@type']} failed: "
-                        f"{evt.get('code')} {evt.get('message')}")
-                return evt
-        raise TimeoutError(f"No response for {query['@type']} in {timeout}s")
+        try:
+            evt = fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            with self._waiter_lock:
+                self._waiters.pop(extra, None)
+            raise TimeoutError(
+                f"No response for {query['@type']} in {timeout}s")
+        if evt.get("@type") == "error":
+            raise RuntimeError(
+                f"{query['@type']} failed: "
+                f"{evt.get('code')} {evt.get('message')}")
+        return evt
 
     def destroy(self):
         if self._client:
+            self._stop_recv = True
+            try:
+                self._recv_thread.join(timeout=1.0)
+            except Exception:
+                pass
             self._td.td_json_client_destroy(self._client)
             self._client = None
 
@@ -238,6 +385,9 @@ def authorize(client: TDClient) -> None:
                      "official Telegram app first.")
         elif state == "authorizationStateReady":
             print("Logged in.")
+            # Stop teeing every event into the auth queue — from here on
+            # only call() (via @extra futures) needs to see them.
+            client.end_auth_mode()
             return
         elif state == "authorizationStateClosed":
             sys.exit("Authorization closed unexpectedly.")
@@ -579,9 +729,53 @@ def test_chunk_sweep(client: TDClient, file_id: int, size: int) -> bool:
     return any(r[4] > 0.5 for r in rows)
 
 
+def test_parallelism(client: TDClient, file_id: int, size: int) -> bool:
+    """Compare sequential vs N-way parallel 1 MiB fetches.
+
+    Tells us whether issuing concurrent readFileRemotePart calls gives
+    real throughput gains — i.e., whether playback is RTT-bound (gains)
+    or bandwidth-bound (flat). Drives the decision on whether to add
+    pipelining in service.py's do_GET.
+    """
+    span_mb = 16
+    print(f"\n[P] Parallelism sweep  ({span_mb} MiB across 1, 2, 4, 8 workers)")
+    if size < (span_mb + 1) * MAX_CHUNK:
+        print("    file too small — skipped")
+        return True
+
+    # Random aligned start; same start for each concurrency setting so
+    # the comparison isn't biased by which region of the file is hot.
+    random.seed(42)
+    base = _aligned(random.randint(MAX_CHUNK, size - (span_mb + 1) * MAX_CHUNK),
+                    MAX_CHUNK)
+    offsets = [base + i * MAX_CHUNK for i in range(span_mb)]
+
+    rows = []
+    for workers in (1, 2, 4, 8):
+        t0 = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(
+                lambda off: stream_chunk(client, file_id, off, MAX_CHUNK),
+                offsets))
+        elapsed = time.monotonic() - t0
+        bytes_got = sum(len(r) for r in results)
+        rate = bytes_got / 1024 / 1024 / elapsed if elapsed else 0
+        rows.append((workers, elapsed, rate))
+        print(f"    {workers:>2} workers  {bytes_got/1024/1024:5.1f} MiB in "
+              f"{elapsed:5.2f}s  = {rate:5.2f} MiB/s")
+
+    serial_rate = rows[0][2]
+    best_workers, best_elapsed, best_rate = max(rows, key=lambda r: r[2])
+    if serial_rate > 0:
+        speedup = best_rate / serial_rate
+        print(f"    best: {best_workers} workers, "
+              f"{speedup:.2f}x vs serial")
+    return rows[0][1] > 0  # PASS as long as serial run completed
+
+
 def test_mid_stream_seek(client: TDClient, file_id: int, size: int) -> bool:
     """Stream 2 MiB, seek to 75%, stream 2 MiB more — covers the actor lifecycle."""
-    print("\n[6] Mid-stream seek  (forward read → jump → forward read)")
+    print("\n[6] Mid-stream seek  (forward read -> jump -> forward read)")
     if size < 16 * 1024 * 1024:
         print("    file too small — skipped")
         return True
@@ -604,9 +798,62 @@ def test_mid_stream_seek(client: TDClient, file_id: int, size: int) -> bool:
     return True
 
 
+def probe_cdn(client: TDClient, file_id: int) -> str:
+    """One 1 MiB fetch at offset 0 to determine CDN routing.
+
+    Returns 'cdn' / 'direct' / 'unknown' based on what the
+    [stream_diag] log line said for this probe call.
+    """
+    pre = count_stream_diag()
+    try:
+        stream_chunk(client, file_id, 0, MAX_CHUNK)
+    except Exception as e:
+        return f"error ({e})"
+    # Tiny delay to let the log file flush — TDLib's file log writes
+    # are usually synchronous, but the diagnostic LOG line happens
+    # immediately before promise.set_value, so a few ms of slack is safe.
+    time.sleep(0.05)
+    cur = count_stream_diag()
+    if cur["cdn_sim_decrypt"] > pre["cdn_sim_decrypt"]:
+        return "cdn_sim"
+    cdn_hit = (cur["cdn_redirect"] > pre["cdn_redirect"]
+               or cur["upload_cdnFile"] > pre["upload_cdnFile"])
+    direct_hit = cur["upload_file"] > pre["upload_file"]
+    if cdn_hit:
+        return "cdn"
+    if direct_hit:
+        return "direct"
+    return "unknown"
+
+
 def run_validation_suite(client: TDClient, rec: dict) -> None:
     print(f"\n=== Streaming validation: {rec['name']} "
           f"({rec['size']/1024/1024:.2f} MiB) ===")
+
+    # Fast precheck: one chunk so the user can see the routing verdict
+    # before committing to the full ~30-60s suite.
+    print("\n[probe] checking CDN routing with one 1 MiB fetch...")
+    pre_probe = count_stream_diag()
+    routing = probe_cdn(client, rec["file_id"])
+    if routing == "cdn":
+        print("[probe] -> CDN-routed. CDN decrypt + reupload code WILL "
+              "be exercised by the suite.")
+    elif routing == "cdn_sim":
+        print("[probe] -> CDN simulation (TD_STREAM_FORCE_CDN_SIM=1). "
+              "Every chunk will round-trip through the AES-CTR code.")
+    elif routing == "direct":
+        print("[probe] -> direct from primary DC. CDN code path NOT "
+              "exercised (file isn't CDN-cached).")
+        print("[probe]    Ctrl-C in the next 3 seconds to skip this "
+              "file.")
+        try:
+            time.sleep(3.0)
+        except KeyboardInterrupt:
+            print("\n[probe] aborted by user.")
+            return
+    else:
+        print(f"[probe] -> {routing}")
+
     tests = [
         test_cold_start,
         test_sequential,
@@ -614,7 +861,9 @@ def run_validation_suite(client: TDClient, rec: dict) -> None:
         test_mid_stream_seek,
         test_consistency,
         test_chunk_sweep,
+        test_parallelism,
     ]
+    pre_counts = pre_probe  # the probe itself is included in this run's delta
     results = []
     overall_start = time.monotonic()
     for t in tests:
@@ -630,6 +879,7 @@ def run_validation_suite(client: TDClient, rec: dict) -> None:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}")
     overall = all(ok for _, ok in results)
     print(f"\n{'ALL PASS' if overall else 'SOME FAILED'}")
+    print_stream_diag(prev=pre_counts)
 
 
 # ---------------------------- Main ---------------------------------------
