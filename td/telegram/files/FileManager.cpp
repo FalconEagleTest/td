@@ -19,11 +19,20 @@
 #include "td/telegram/net/NetQueryDispatcher.h"
 #include "td/telegram/net/NetQuery.h"
 #include "td/actor/actor.h"
+#include "td/utils/as.h"
+#include "td/utils/crypto.h"
 
 namespace td {
-// One-shot actor that runs a single MTProto upload.getFile to fetch a remote byte range,
-// with automatic file_reference refresh on FILE_REFERENCE_EXPIRED. The actor stops itself
-// after fulfilling its promise.
+// One-shot actor that fetches a remote byte range via the patched
+// readFileRemotePart streaming path. Supports:
+//   * Direct upload.getFile from the file's home DC (cdn_supported=true,
+//     so we may instead get back upload.fileCdnRedirect)
+//   * CDN: upload.getCdnFile to the CDN DC, AES-CTR-decrypt the bytes
+//   * Reupload-needed: upload.reuploadCdnFile against the primary DC,
+//     then retry the CDN fetch
+//   * FILE_REFERENCE_EXPIRED: clear cached CDN state, refresh the
+//     remote location via FileManager, restart from the Direct phase
+// Actor stops itself after fulfilling its promise.
 class StreamGetFileActor final : public NetQueryCallback {
  public:
   StreamGetFileActor(FileId file_id, int64 offset, int32 length, FullRemoteFileLocation remote,
@@ -44,26 +53,15 @@ class StreamGetFileActor final : public NetQueryCallback {
     if (net_query->is_error()) {
       return handle_error(net_query->move_as_error());
     }
-
-    // Guard against upload.fileCdnRedirect — proper CDN streaming would need a separate flow.
-    if (net_query->ok_tl_constructor() == telegram_api::upload_fileCdnRedirect::ID) {
-      promise_.set_error(Status::Error(500, "CDN file streaming is not supported"));
-      return stop();
+    auto ctor = net_query->ok_tl_constructor();
+    switch (last_phase_) {
+      case Phase::Direct:
+        return on_direct_result(ctor, std::move(net_query));
+      case Phase::Cdn:
+        return on_cdn_result(ctor, std::move(net_query));
+      case Phase::Reupload:
+        return on_reupload_result(std::move(net_query));
     }
-
-    auto r_file_base = fetch_result<telegram_api::upload_getFile>(net_query->ok());
-    if (r_file_base.is_error()) {
-      promise_.set_error(r_file_base.move_as_error());
-      return stop();
-    }
-    auto file_base = r_file_base.move_as_ok();
-    if (file_base->get_id() != telegram_api::upload_file::ID) {
-      promise_.set_error(Status::Error(500, "Unexpected upload.getFile response"));
-      return stop();
-    }
-    auto file = move_tl_object_as<telegram_api::upload_file>(file_base);
-    promise_.set_value(file->bytes_.as_slice().str());
-    stop();
   }
 
   void hangup() override {
@@ -74,6 +72,8 @@ class StreamGetFileActor final : public NetQueryCallback {
   }
 
  private:
+  enum class Phase { Direct, Cdn, Reupload };
+
   FileId file_id_;
   int64 offset_;
   int32 length_;
@@ -82,20 +82,137 @@ class StreamGetFileActor final : public NetQueryCallback {
   Promise<string> promise_;
   int retries_left_ = 3;
 
+  Phase last_phase_ = Phase::Direct;
+  bool have_cdn_ = false;
+  string cdn_file_token_;
+  DcId cdn_dc_id_;
+  string cdn_encryption_key_;  // 32 bytes
+  string cdn_encryption_iv_;   // 16 bytes
+  string cdn_reupload_token_;  // non-empty triggers a Reupload phase
+
   void dispatch_query() {
-    auto input_location = remote_.as_input_file_location();
-    if (!input_location) {
-      promise_.set_error(Status::Error(400, "Can't create input file location"));
+    NetQueryPtr net_query;
+    if (!have_cdn_) {
+      auto input_location = remote_.as_input_file_location();
+      if (!input_location) {
+        promise_.set_error(Status::Error(400, "Can't create input file location"));
+        return stop();
+      }
+      last_phase_ = Phase::Direct;
+      net_query = G()->net_query_creator().create(
+          telegram_api::upload_getFile(0, false, /*cdn_supported=*/true,
+                                       std::move(input_location), offset_, length_),
+          {}, remote_.get_dc_id());
+    } else if (!cdn_reupload_token_.empty()) {
+      last_phase_ = Phase::Reupload;
+      net_query = G()->net_query_creator().create(
+          telegram_api::upload_reuploadCdnFile(BufferSlice(cdn_file_token_),
+                                               BufferSlice(cdn_reupload_token_)),
+          {}, remote_.get_dc_id());
+      cdn_reupload_token_.clear();
+    } else {
+      last_phase_ = Phase::Cdn;
+      net_query = G()->net_query_creator().create_unauth(
+          telegram_api::upload_getCdnFile(BufferSlice(cdn_file_token_), offset_, length_),
+          cdn_dc_id_);
+    }
+    G()->net_query_dispatcher().dispatch_with_callback(std::move(net_query), actor_shared(this));
+  }
+
+  void on_direct_result(int32 ctor, NetQueryPtr net_query) {
+    if (ctor == telegram_api::upload_fileCdnRedirect::ID) {
+      auto r = fetch_result<telegram_api::upload_getFile>(net_query->ok());
+      if (r.is_error()) {
+        promise_.set_error(r.move_as_error());
+        return stop();
+      }
+      auto redirect = move_tl_object_as<telegram_api::upload_fileCdnRedirect>(r.move_as_ok());
+      cdn_file_token_ = redirect->file_token_.as_slice().str();
+      cdn_dc_id_ = DcId::external(redirect->dc_id_);
+      cdn_encryption_key_ = redirect->encryption_key_.as_slice().str();
+      cdn_encryption_iv_ = redirect->encryption_iv_.as_slice().str();
+      if (cdn_encryption_key_.size() != 32 || cdn_encryption_iv_.size() != 16) {
+        promise_.set_error(Status::Error(500, "Invalid CDN key or IV size"));
+        return stop();
+      }
+      have_cdn_ = true;
+      return dispatch_query();
+    }
+    if (ctor != telegram_api::upload_file::ID) {
+      promise_.set_error(Status::Error(500, "Unexpected upload.getFile response"));
       return stop();
     }
-    auto query = telegram_api::upload_getFile(0, false, false, std::move(input_location), offset_, length_);
-    auto net_query = G()->net_query_creator().create(query, {}, remote_.get_dc_id());
-    G()->net_query_dispatcher().dispatch_with_callback(std::move(net_query), actor_shared(this));
+    auto r = fetch_result<telegram_api::upload_getFile>(net_query->ok());
+    if (r.is_error()) {
+      promise_.set_error(r.move_as_error());
+      return stop();
+    }
+    auto file = move_tl_object_as<telegram_api::upload_file>(r.move_as_ok());
+
+    promise_.set_value(file->bytes_.as_slice().str());
+    stop();
+  }
+
+  void on_cdn_result(int32 ctor, NetQueryPtr net_query) {
+    if (ctor == telegram_api::upload_cdnFileReuploadNeeded::ID) {
+      auto r = fetch_result<telegram_api::upload_getCdnFile>(net_query->ok());
+      if (r.is_error()) {
+        promise_.set_error(r.move_as_error());
+        return stop();
+      }
+      auto reup = move_tl_object_as<telegram_api::upload_cdnFileReuploadNeeded>(r.move_as_ok());
+      cdn_reupload_token_ = reup->request_token_.as_slice().str();
+      return dispatch_query();
+    }
+    if (ctor != telegram_api::upload_cdnFile::ID) {
+      promise_.set_error(Status::Error(500, "Unexpected upload.getCdnFile response"));
+      return stop();
+    }
+    auto r = fetch_result<telegram_api::upload_getCdnFile>(net_query->ok());
+    if (r.is_error()) {
+      promise_.set_error(r.move_as_error());
+      return stop();
+    }
+    auto cdn = move_tl_object_as<telegram_api::upload_cdnFile>(r.move_as_ok());
+    BufferSlice bytes = std::move(cdn->bytes_);
+
+    // AES-CTR decrypt. Counter for the first block = offset/16, written
+    // into IV[12..16] as a big-endian uint32 (mirrors FileDownloader).
+    if (offset_ % 16 != 0) {
+      promise_.set_error(Status::Error(500, "CDN offset must be 16-byte aligned"));
+      return stop();
+    }
+    auto ctr = narrow_cast<uint32>(offset_ / 16);
+    ctr = ((ctr & 0xff) << 24) | ((ctr & 0xff00) << 8)
+        | ((ctr & 0xff0000) >> 8) | ((ctr & 0xff000000) >> 24);
+    string iv = cdn_encryption_iv_;
+    as<uint32>(&iv[12]) = ctr;
+    AesCtrState ctr_state;
+    ctr_state.init(cdn_encryption_key_, iv);
+    ctr_state.decrypt(bytes.as_slice(), bytes.as_mutable_slice());
+
+    promise_.set_value(bytes.as_slice().str());
+    stop();
+  }
+
+  void on_reupload_result(NetQueryPtr net_query) {
+    // upload.reuploadCdnFile returns Vector<FileHash>. We don't verify
+    // hashes in this first cut — just retry the CDN fetch on success.
+    auto r = fetch_result<telegram_api::upload_reuploadCdnFile>(net_query->ok());
+    if (r.is_error()) {
+      promise_.set_error(r.move_as_error());
+      return stop();
+    }
+    return dispatch_query();
   }
 
   void handle_error(Status error) {
     if (retries_left_ > 0 && FileReferenceManager::is_file_reference_error(error)) {
       retries_left_--;
+      // Reset CDN state — after a file_reference refresh we restart from
+      // the Direct phase so a new redirect (and fresh CDN token) is issued.
+      have_cdn_ = false;
+      cdn_reupload_token_.clear();
       string bad_reference = remote_.get_file_reference().str();
       send_closure(file_manager_, &FileManager::repair_stream_file_reference, file_id_, std::move(bad_reference),
                    PromiseCreator::lambda([actor_id = actor_id(this)](Result<FullRemoteFileLocation> r) {
@@ -103,8 +220,10 @@ class StreamGetFileActor final : public NetQueryCallback {
                    }));
       return;
     }
-    LOG(INFO) << "STREAMING: upload.getFile failed file_id=" << file_id_.get() << " offset=" << offset_
-              << " length=" << length_ << " error=" << error;
+    LOG(INFO) << "STREAMING: phase=" << static_cast<int>(last_phase_)
+              << " failed file_id=" << file_id_.get()
+              << " offset=" << offset_ << " length=" << length_
+              << " error=" << error;
     promise_.set_error(std::move(error));
     stop();
   }
@@ -156,11 +275,9 @@ namespace {
 constexpr int64 MAX_FILE_SIZE = static_cast<int64>(4000) << 20;  // 4000MB
 }  // namespace
 
-void FileManager::download_stream_part(FileId file_id, int8 priority, int64 offset, int32 count, bool no_store,
+void FileManager::download_stream_part(FileId file_id, int64 offset, int32 count,
                                        Promise<td_api::object_ptr<td_api::data>> promise) {
   TRY_STATUS_PROMISE(promise, G()->close_status());
-  (void)priority;  // direct streaming path doesn't queue, so priority is informational
-  (void)no_store;  // streaming never persists; flag is reserved for future cache integration
 
   constexpr int32 MAX_COUNT = 1024 * 1024;  // MTProto upload.getFile hard limit
   if (offset < 0) {
@@ -182,6 +299,44 @@ void FileManager::download_stream_part(FileId file_id, int8 priority, int64 offs
     return promise.set_error(Status::Error(400, "Range must not cross a 1 MiB boundary"));
   }
 
+  // Wrap the td_api::data promise into a raw string promise.
+  // The JSON serializer base64-encodes td_api::data::data automatically;
+  // we must not pre-encode — that would double-encode on the wire.
+  auto wrap_promise = [](Promise<td_api::object_ptr<td_api::data>> p) -> Promise<string> {
+    return PromiseCreator::lambda([p = std::move(p)](Result<string> r) mutable {
+      if (r.is_error()) return p.set_error(r.move_as_error());
+      p.set_value(td_api::make_object<td_api::data>(r.move_as_ok()));
+    });
+  };
+
+  // ── Check the read-ahead prefetch slot ──────────────────────────────────
+  auto &slot = stream_prefetch_;
+  if (slot.file_id == file_id && slot.offset == offset && slot.count == count) {
+    if (slot.ready) {
+      // Cache hit — return instantly, then kick off the next prefetch.
+      auto raw_promise = wrap_promise(std::move(promise));
+      int64 next_offset = offset + count;
+      string data = std::move(slot.data);
+      Status error = std::move(slot.error);
+      slot = StreamPrefetchSlot{};  // clear before starting next prefetch
+      start_stream_prefetch(file_id, next_offset, count);
+      if (error.is_ok()) {
+        raw_promise.set_value(std::move(data));
+      } else {
+        raw_promise.set_error(std::move(error));
+      }
+    } else {
+      // In-flight — enqueue; on_stream_prefetch_done will fulfill it.
+      slot.waiters.push_back(wrap_promise(std::move(promise)));
+    }
+    return;
+  }
+
+  // ── Cache miss (seek or first call) ─────────────────────────────────────
+  // Invalidate any stale prefetch slot (a seek arrived; the old actor will
+  // complete and on_stream_prefetch_done will discard the stale result).
+  slot = StreamPrefetchSlot{};
+
   auto file_view = get_file_view(file_id);
   if (file_view.empty()) {
     return promise.set_error(Status::Error(400, "Unknown file_id"));
@@ -189,25 +344,103 @@ void FileManager::download_stream_part(FileId file_id, int8 priority, int64 offs
   if (!file_view.has_full_remote_location()) {
     return promise.set_error(Status::Error(400, "File has no remote location"));
   }
-  const auto *remote = file_view.get_full_remote_location();
-  if (remote == nullptr) {
+  const auto *remote_ptr = file_view.get_full_remote_location();
+  if (remote_ptr == nullptr) {
     return promise.set_error(Status::Error(400, "Remote location unavailable"));
   }
 
-  Promise<string> raw_promise = PromiseCreator::lambda([promise = std::move(promise)](Result<string> r) mutable {
-    if (r.is_error()) {
-      return promise.set_error(r.move_as_error());
-    }
-    // The td_api::data.data field is a `bytes` type; the JSON serializer
-    // base64-encodes it automatically. Passing pre-encoded bytes here
-    // would double-encode — the client would see the base64 string of
-    // a base64 string instead of the original bytes.
-    promise.set_value(td_api::make_object<td_api::data>(r.move_as_ok()));
-  });
+  // After fulfilling the request, kick off the next sequential chunk.
+  int64 next_offset = offset + count;
+  Promise<string> actor_promise = PromiseCreator::lambda(
+      [actor_id = actor_id(this), file_id, next_offset, count,
+       raw_promise = wrap_promise(std::move(promise))](Result<string> r) mutable {
+        if (r.is_error()) {
+          raw_promise.set_error(r.move_as_error());
+          return;
+        }
+        raw_promise.set_value(r.move_as_ok());
+        // Trigger prefetch for the next chunk on the FileManager actor thread.
+        send_closure(actor_id, &FileManager::start_stream_prefetch,
+                     file_id, next_offset, count);
+      });
 
-  create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, count, *remote, actor_id(this),
-                                   std::move(raw_promise))
-      .release();
+  create_actor<StreamGetFileActor>("StreamGetFileActor", file_id, offset, count,
+                                   *remote_ptr, actor_id(this),
+                                   std::move(actor_promise)).release();
+}
+
+void FileManager::start_stream_prefetch(FileId file_id, int64 next_offset, int32 count) {
+  constexpr int32 MAX_COUNT = 1024 * 1024;
+  constexpr int32 ALIGN = 4096;
+
+  // Validate the next offset before starting a prefetch.
+  if (next_offset < 0 || next_offset % ALIGN != 0) return;
+  if (count <= 0 || count > MAX_COUNT || count % ALIGN != 0 || MAX_COUNT % count != 0) return;
+  // Each MTProto chunk must fit within a single 1 MiB block.
+  if (next_offset / MAX_COUNT != (next_offset + count - 1) / MAX_COUNT) return;
+
+  auto file_view = get_file_view(file_id);
+  if (file_view.empty() || !file_view.has_full_remote_location()) return;
+  // Don't prefetch past the known file size.
+  auto file_size = file_view.size();
+  if (file_size > 0 && next_offset >= file_size) return;
+
+  auto &slot = stream_prefetch_;
+  // Already prefetching this exact chunk — nothing to do.
+  if (slot.file_id == file_id && slot.offset == next_offset && slot.count == count) return;
+
+  // Set up the new prefetch slot (clears any stale slot).
+  slot = StreamPrefetchSlot{};
+  slot.file_id = file_id;
+  slot.offset  = next_offset;
+  slot.count   = count;
+
+  auto remote = *file_view.get_full_remote_location();
+
+  Promise<string> prefetch_promise = PromiseCreator::lambda(
+      [actor_id = actor_id(this), file_id, next_offset](Result<string> r) mutable {
+        send_closure(actor_id, &FileManager::on_stream_prefetch_done,
+                     file_id, next_offset, std::move(r));
+      });
+
+  LOG(INFO) << "STREAMING prefetch: file_id=" << file_id.get()
+            << " offset=" << next_offset << " count=" << count;
+
+  create_actor<StreamGetFileActor>("StreamGetFileActor_prefetch", file_id,
+                                   next_offset, count, std::move(remote),
+                                   actor_id(this), std::move(prefetch_promise)).release();
+}
+
+void FileManager::on_stream_prefetch_done(FileId file_id, int64 offset, Result<string> result) {
+  auto &slot = stream_prefetch_;
+  // Discard stale result — a seek happened and the slot was replaced.
+  if (slot.file_id != file_id || slot.offset != offset) {
+    LOG(INFO) << "STREAMING prefetch: discarding stale result for file_id="
+              << file_id.get() << " offset=" << offset;
+    return;
+  }
+
+  slot.ready = true;
+  if (result.is_ok()) {
+    slot.data  = result.move_as_ok();
+  } else {
+    slot.error = result.move_as_error();
+  }
+
+  LOG(INFO) << "STREAMING prefetch: ready file_id=" << file_id.get()
+            << " offset=" << offset
+            << (slot.error.is_ok() ? " ok" : " error");
+
+  // Fulfill any callers that joined the waiters list while we were fetching.
+  for (auto &w : slot.waiters) {
+    if (slot.error.is_ok()) {
+      w.set_value(slot.data);  // copy — each waiter gets its own string
+    } else {
+      w.set_error(slot.error.clone());
+    }
+  }
+  slot.waiters.clear();
+  // Leave slot.ready=true so the NEXT caller gets an instant hit.
 }
 
 void FileManager::repair_stream_file_reference(FileId file_id, string bad_reference,

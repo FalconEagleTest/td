@@ -513,14 +513,22 @@ class FileManager final : public Actor {
   bool set_encryption_key(FileId file_id, FileEncryptionKey key);
   bool set_content(FileId file_id, BufferSlice bytes);
 
-  // --- Streaming (no-store) API: fetch arbitrary remote range without persisting ---
-  void download_stream_part(FileId file_id, int8 priority, int64 offset, int32 count, bool no_store,
+  // readFileRemotePart implementation: fetch a remote byte range without
+  // persisting it locally. See StreamGetFileActor in FileManager.cpp.
+  void download_stream_part(FileId file_id, int64 offset, int32 count,
                             Promise<td_api::object_ptr<td_api::data>> promise);
 
   // Internal helpers used by StreamGetFileActor to recover from FILE_REFERENCE_EXPIRED.
   void repair_stream_file_reference(FileId file_id, string bad_reference,
                                     Promise<FullRemoteFileLocation> promise);
   void on_stream_file_reference_repaired(FileId file_id, Promise<FullRemoteFileLocation> promise);
+
+  // ── Sequential read-ahead prefetch (stream_prefetch.cpp section) ──────
+  // After completing a download_stream_part request the next sequential
+  // chunk is kicked off automatically so it arrives before Python asks
+  // for it, hiding the Telegram RTT for sequential playback.
+  void start_stream_prefetch(FileId file_id, int64 next_offset, int32 count);
+  void on_stream_prefetch_done(FileId file_id, int64 offset, Result<string> result);
 
   void check_local_location(FileId file_id, bool skip_file_size_checks);
   void check_local_location_async(FileId file_id, bool skip_file_size_checks);
@@ -882,6 +890,19 @@ class FileManager final : public Actor {
   static std::atomic<int64> internal_load_id_;
 
   bool is_closed_ = false;
+
+  // ── Sequential read-ahead prefetch slot ─────────────────────────────────
+  // One slot per FileManager (sufficient — one file streams at a time).
+  // Accessed only on the FileManager actor thread → no locking needed.
+  struct StreamPrefetchSlot {
+    FileId  file_id;
+    int64   offset{-1};
+    int32   count{0};
+    bool    ready{false};
+    string  data;
+    Status  error;
+    vector<Promise<string>> waiters;  // callers that arrived while inflight
+  } stream_prefetch_;
 
   std::set<std::string> bad_paths_;
 
