@@ -2,6 +2,16 @@ cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 
 project(TDLib VERSION 1.8.67 LANGUAGES CXX C)
 
+# __FILE__ (used throughout TDLib's own CHECK/LOG macros) embeds the
+# absolute build-time source path as a literal string in every compiled
+# object file, which `strip` does not remove. Rewrite it to a relative,
+# machine-independent path at compile time instead of leaking whatever
+# local path this was built from.
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=td")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=td")
+endif()
+
 if (NOT DEFINED CMAKE_MODULE_PATH)
   set(CMAKE_MODULE_PATH "")
 endif()
