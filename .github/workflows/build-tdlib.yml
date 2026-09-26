@@ -65,7 +65,18 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/tdlib/td.git
           git fetch upstream master
+          echo "PRE_REBASE_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
           git rebase upstream/master
+
+      - name: Check for TDLib API changes that could silently break telemedia
+        # Runs before the push: a detected breaking change stops here and
+        # leaves origin/production at its last-known-good commit, rather
+        # than shipping a schema break and only failing the build after.
+        run: |
+          python3 scripts/check_telemedia_api_compat.py "$PRE_REBASE_SHA" HEAD
+
+      - name: Push rebased production
+        run: |
           # Rebase rewrites history so force push is required
           git push origin production --force-with-lease
 
