@@ -27,12 +27,27 @@ this script only protects methods it's told about.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 TL_PATH = "td/generate/scheme/td_api.tl"
 SURFACE_FILE = Path(__file__).parent / "telemedia_api_surface.txt"
+
+
+def write_step_summary(markdown: str) -> None:
+    """Append to GitHub Actions' job summary page, if running in CI.
+
+    Makes a failure show up on the run's summary page (what you land on
+    when you open a failed run from a notification email) instead of
+    requiring a scroll through raw step logs to notice.
+    """
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    with open(summary_path, "a", encoding="utf-8") as f:
+        f.write(markdown)
 
 
 def git_show_lines(ref: str, path: str) -> list[str]:
@@ -79,22 +94,35 @@ def main() -> int:
             changed.append((method, old_def, new_def))
 
     if not changed and not removed:
-        print(f"OK: all {len(methods)} tracked telemedia API methods unchanged between "
-              f"{old_ref} and {new_ref}.")
+        msg = (f"OK: all {len(methods)} tracked telemedia API methods unchanged between "
+               f"{old_ref} and {new_ref}.")
+        print(msg)
+        write_step_summary(f"### :white_check_mark: telemedia API compatibility check\n{msg}\n")
         return 0
 
     print(f"WARNING: {len(changed)} changed, {len(removed)} removed, out of "
           f"{len(methods)} tracked methods telemedia depends on.\n")
+    summary = [
+        "### :x: telemedia API compatibility check FAILED\n",
+        f"{len(changed)} changed, {len(removed)} removed, out of {len(methods)} "
+        "tracked methods telemedia depends on.\n",
+        "TDLib's JSON API silently swallows unrecognized fields instead of "
+        "erroring, so these will break telemedia quietly, not loudly -- "
+        "check its call sites for each one below before trusting this build.\n",
+    ]
     for method, old_def in removed:
         print(f"REMOVED: {method}")
         print(f"  was: {old_def}\n")
+        summary.append(f"**REMOVED** `{method}`\n```\n{old_def}\n```\n")
     for method, old_def, new_def in changed:
         print(f"CHANGED: {method}")
         print(f"  old: {old_def}")
         print(f"  new: {new_def}\n")
+        summary.append(f"**CHANGED** `{method}`\n```diff\n- {old_def}\n+ {new_def}\n```\n")
     print("These are exactly the kind of changes TDLib's JSON API silently "
           "swallows instead of erroring -- check telemedia's call sites for "
           "each one above before trusting this build.")
+    write_step_summary("\n".join(summary))
     return 1
 
 
