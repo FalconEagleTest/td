@@ -21,11 +21,11 @@ on:
       build_linux_arm:
         description: 'Build Linux ARM64 + ARMhf .so (Raspberry Pi / CoreELEC)'
         type: boolean
-        default: false
+        default: true
       build_linux_x64:
-        description: 'Build Linux x64 .so (PC / server)'
+        description: 'Build Linux x64 .so (PC / server) — run_dub CI depends on this being in the latest release'
         type: boolean
-        default: false
+        default: true
       create_release:
         description: 'Create a GitHub Release with the built artifacts'
         type: boolean
