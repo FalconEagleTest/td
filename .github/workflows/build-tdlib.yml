@@ -229,9 +229,9 @@ jobs:
         if: steps.openssl-cache.outputs.cache-hit != 'true'
         working-directory: example/android
         run: |
-          # Restrict to Kodi ABIs only
+          # Restrict to Kodi ABIs only (build-openssl.sh has no ABI parameter; build-tdlib.sh gets one below)
           sed -i 's/^for ABI in arm64-v8a armeabi-v7a x86_64 x86 ; do/for ABI in arm64-v8a armeabi-v7a ; do/' \
-            build-openssl.sh build-tdlib.sh
+            build-openssl.sh
           ./build-openssl.sh SDK
 
       - name: Patch ABI restriction (if OpenSSL was cached)
@@ -239,7 +239,7 @@ jobs:
         working-directory: example/android
         run: |
           sed -i 's/^for ABI in arm64-v8a armeabi-v7a x86_64 x86 ; do/for ABI in arm64-v8a armeabi-v7a ; do/' \
-            build-openssl.sh build-tdlib.sh
+            build-openssl.sh
 
       # ── TDLib build cache ────────────────────────────────────
       - name: Restore TDLib Android build cache
@@ -247,8 +247,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            example/android/build-arm64-v8a-JSON
-            example/android/build-armeabi-v7a-JSON
+            example/android/build-16-arm64-v8a-JSON
+            example/android/build-16-armeabi-v7a-JSON
           key: android-tdlib-${{ env.CACHE_EPOCH }}-${{ env.NDK_R }}-${{ hashFiles('CMakeLists.txt', 'td/**/*.cpp', 'td/**/*.h') }}
           restore-keys: |
             android-tdlib-${{ env.CACHE_EPOCH }}-${{ env.NDK_R }}-
@@ -256,7 +256,8 @@ jobs:
       - name: Build TDLib JSON for Android (incremental)
         working-directory: example/android
         run: |
-          ./build-tdlib.sh SDK "" "" "" "JSON"
+          # 6th = API level (default 16), 7th = ABIs (upstream parameter since 2026-11)
+          ./build-tdlib.sh SDK "" "" "" "JSON" "" "arm64-v8a armeabi-v7a"
 
       - name: Collect .so artifacts + zip
         run: |
