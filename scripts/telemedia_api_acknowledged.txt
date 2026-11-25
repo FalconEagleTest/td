@@ -1,0 +1,6 @@
+# Schema lines verified safe for telemedia. Exact match on the NEW line, so any
+# further change to the method fails the compat check again.
+# 2026-11-25 getForumTopics gained optional icon_custom_emoji_id/exclude_open/
+# exclude_closed; telemedia (file_list.py:88) sends only chat_id + limit, and
+# omitted fields default to 0/false.
+getForumTopics chat_id:int53 query:string icon_custom_emoji_id:int64 exclude_open:Bool exclude_closed:Bool offset_date:int32 offset_message_id:int53 offset_forum_topic_id:int32 limit:int32 = ForumTopics;

@@ -18,6 +18,10 @@ Exit code is nonzero if any tracked method's schema changed or disappeared,
 so this can gate CI (fail the rebase job loudly) instead of shipping a
 silent break.
 
+A changed method whose exact new schema line is listed in
+scripts/telemedia_api_acknowledged.txt (after checking telemedia's call sites) no
+longer fails the check; any further change to it fails again.
+
 The tracked method list (scripts/telemedia_api_surface.txt) is a snapshot
 of every distinct `'@type': '...'` value telemedia's default.py/service.py
 send or construct, extracted via:
@@ -34,6 +38,7 @@ from pathlib import Path
 
 TL_PATH = "td/generate/scheme/td_api.tl"
 SURFACE_FILE = Path(__file__).parent / "telemedia_api_surface.txt"
+ACK_FILE = Path(__file__).parent / "telemedia_api_acknowledged.txt"
 
 
 def write_step_summary(markdown: str) -> None:
@@ -56,6 +61,18 @@ def git_show_lines(ref: str, path: str) -> list[str]:
         capture_output=True, text=True, check=True,
     )
     return result.stdout.splitlines()
+
+
+def read_acknowledged() -> set[str]:
+    """Exact new schema lines a human has verified as safe for telemedia.
+
+    One td_api.tl line per entry (blank lines and '#' comments ignored). Matching
+    the whole line means any FURTHER change to that method fails the check again.
+    """
+    if not ACK_FILE.exists():
+        return set()
+    return {l.strip() for l in ACK_FILE.read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.lstrip().startswith("#")}
 
 
 def extract_schema_line(lines: list[str], method: str) -> str | None:
@@ -81,8 +98,10 @@ def main() -> int:
         print(f"ERROR: could not read {TL_PATH} at both refs: {e}", file=sys.stderr)
         return 2
 
+    acknowledged = read_acknowledged()
     changed = []
     removed = []
+    acked = []
     for method in methods:
         old_def = extract_schema_line(old_lines, method)
         new_def = extract_schema_line(new_lines, method)
@@ -91,11 +110,17 @@ def main() -> int:
         if old_def is not None and new_def is None:
             removed.append((method, old_def))
         elif old_def != new_def:
-            changed.append((method, old_def, new_def))
+            if new_def in acknowledged:
+                acked.append(method)
+            else:
+                changed.append((method, old_def, new_def))
 
     if not changed and not removed:
         msg = (f"OK: all {len(methods)} tracked telemedia API methods unchanged between "
                f"{old_ref} and {new_ref}.")
+        if acked:
+            msg = (f"OK: {len(acked)} tracked method(s) changed but acknowledged in "
+                   f"{ACK_FILE.name} ({', '.join(acked)}); the rest unchanged.")
         print(msg)
         write_step_summary(f"### :white_check_mark: telemedia API compatibility check\n{msg}\n")
         return 0

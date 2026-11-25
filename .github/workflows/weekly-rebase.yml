@@ -1,0 +1,37 @@
+name: Weekly rebase onto upstream
+
+# Keeps production close to tdlib/td master so each rebase has few conflicts.
+# Rebase + telemedia API compat check + push only; no builds (run "Build TDLib"
+# by hand when a release is wanted, with "Rebase first" off). A conflict or an
+# unacknowledged API change fails this run and leaves production untouched.
+on:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+jobs:
+  rebase:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebase onto upstream
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/tdlib/td.git
+          git fetch upstream master
+          echo "PRE_REBASE_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          git rebase upstream/master
+
+      - name: Check for TDLib API changes that could silently break telemedia
+        run: python3 scripts/check_telemedia_api_compat.py "$PRE_REBASE_SHA" HEAD
+
+      - name: Push rebased production
+        run: git push origin production --force-with-lease
